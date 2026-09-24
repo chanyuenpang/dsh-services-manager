@@ -59,14 +59,17 @@ dsh --profile sandbox --port 3099 --no-open *> "$sandbox\..\logs\sandbox-web.log
 | `cannot get property "webServer" without inject`，整个 profile 起不来 | `connection.rpc.handle` 需要 **`connection` 行**注入 `webServer`/`webRuntime`；随包模板里没有，正式 profile 靠 patch 补 | 在该 profile 的 `cordis.patch.yml` 加 `- id: connection` + `inject: [webRuntime, webServer]`。**沙箱 profile 也必须加**（新建 profile 最容易漏这一步）。注意不是给自己的插件行加 inject —— 实测给 `dsh-services-manager` 行加 `inject: [webServer]` 无效 |
 | `Cannot find module '…\"…scratch-server.mjs\"'` | 把整条 shell 命令当成**单个** argv 元素交给 `cmd.exe`：Node 会给它整体加引号并把内部引号转义成 `\"`，cmd 不认 | 引用感知分词后把参数各自独立传：`cmd.exe /d /s /c <程序> <参数…>`（见 `src/command.mjs`） |
 | 主动 `stop` 之后状态显示 `error` | 被 terminate 的进程退出码非零，被当成崩溃 | 记录 `lastStopAt`，只有「不是我们主动停止」造成的非零退出才算异常 |
-| 用 CIM 过滤器批量杀进程时**把自己的命令树也杀了**（job runner exit 1） | 过滤器的关键字出现在执行它的 runner/pwsh 自己的命令行里（命令行 = 脚本正文），于是自我匹配 | 拼接避开连续关键字（例如 `'--' + 'supervise'`），或先查出 PID 再按 PID 精确杀 |
+| 用 CIM 过滤器批量杀进程时**把自己的命令树也杀了**（job runner exit 1）；排查时还会看到「多出来一个看守进程」 | 过滤器的关键字出现在执行它的 runner/pwsh 自己的命令行里（命令行 = 脚本正文），于是自我匹配。**只按 `Name='node.exe'` 过滤不够** —— 承载这条命令的 runner 也是 node.exe | 拼接避开连续关键字（例如 `'--' + 'supervise'`），或先查出 PID 再按 PID 精确杀；结果里若出现「刚好在本命令启动时刻创建」的进程，先怀疑是自己 |
 | 面板每个操作都报 `Cannot read properties of undefined (reading 'raw')` | 宿主 RPC 信封字段写成了 `data`；传输层按 schema 校验会**剥掉未知键**，浏览器只收到 `{ok:true}` | 信封必须是 `{ok:true, value}` / `{ok:false, error:{code,message,details}}`（`details` 必填对象）。这条只有真正跑 HTTP 层才暴露 —— 见下条验证方式 |
 
 ## 其它约定
 
-- 单测：`npm test`（netstat 解析、签名正反例、配置校验/原子写/冲突、命令分词）。
-- 真机验证（不重启 dsh）：`node scripts/verify-host.mjs 4599`、`node scripts/verify-lifecycle.mjs 4598`。
+- 单测：`npm test`（netstat 解析、签名正反例、配置校验/原子写/冲突、命令分词、浏览器半边无浏览器冒烟）。
+- 真机验证（不重启 dsh）：`node scripts/verify-host.mjs 4599`、`node scripts/verify-lifecycle.mjs 4598`、
+  `node scripts/verify-form-api.mjs 4597`（表单写入路径）、`node scripts/bench-snapshot.mjs 5`（耗时与心跳最坏间隔）。
 - **HTTP 层验证（信封/真实传输，唯一能抓到字段错误的一层）**：`node scripts/verify-rpc-http.mjs "<token url>"`；
   token 在 `<DSH_HOME>/.dsh-services-manager/logs/dsh-web.log` 最后一行，或浏览器地址栏。只读端点，不碰重启。
+- 预览沙箱：`pwsh -File scripts/preview-sandbox.ps1`（打印预览地址）／`-Stop` 停止。
+  客户端改动**硬刷新**即可（bundle 走 immutable 长缓存）；**宿主改动必须重启沙箱实例**，否则新端点不存在。
 - 活性判定只认端口 LISTENING；终止外部进程前必须过命令行签名校验（`match.commandLinePattern`）。
 - 服务定义的唯一事实来源是 `<DSH_HOME>/.dsh-services-manager/services.json`，运行态绝不写回。
