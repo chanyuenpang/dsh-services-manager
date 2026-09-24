@@ -74,10 +74,13 @@ export function createFakeSeam({ configPath, stateDir, logDir }) {
       error.details = result?.error?.details
       throw error
     }
-    return result.data
+    return result.value
   }
 
-  return { ctx, disposers, invoke }
+  /** 插件加载时必须作为第二个参数传入的 config 段（宿主半边不再读 ctx.config）。 */
+  const pluginConfig = { configPath, stateDir, logDir }
+
+  return { ctx, disposers, invoke, pluginConfig }
 }
 
 export const sleep = (ms) => new Promise((done) => setTimeout(done, ms))

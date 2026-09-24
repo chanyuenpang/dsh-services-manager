@@ -91,7 +91,7 @@ const brief = (service) => ({
   ownership: service.ownership, pid: service.pid, lastError: service.lastError ?? null,
 })
 
-apply(ctx)
+apply(ctx, { configPath, stateDir, logDir })
 const call = handlers.get('/dsh-services')
 assert.ok(typeof call === 'function', 'RPC 通道 /dsh-services 未注册')
 
@@ -103,7 +103,7 @@ async function invoke(endpoint, payload) {
     error.details = result?.error?.details
     throw error
   }
-  return result.data
+  return result.value
 }
 
 async function refusal(endpoint, payload) {

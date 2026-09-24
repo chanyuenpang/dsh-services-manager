@@ -56,14 +56,17 @@ export function apply(ctx, config) {
   ctx.effect(() => {
     const dispose = connection.rpc.handle(RPC_CHANNEL, async (endpoint, payload) => {
       try {
-        return { ok: true, data: await manager.handle(endpoint, payload ?? {}) }
+        // 信封契约（client-connection 的 rpcResultSchema）：
+        //   成功 = { ok: true, value }；失败 = { ok: false, error: { code, message, details } }
+        // 字段名是 value 而不是 data；details 在 schema 里是必填对象，所以永远给对象。
+        return { ok: true, value: await manager.handle(endpoint, payload ?? {}) }
       } catch (error) {
         return {
           ok: false,
           error: {
             code: typeof error?.code === 'string' ? error.code : 'OPERATION_FAILED',
             message: String(error?.message ?? error),
-            ...(error?.details === undefined ? {} : { details: error.details }),
+            details: error?.details !== null && typeof error?.details === 'object' ? error.details : {},
           },
         }
       }

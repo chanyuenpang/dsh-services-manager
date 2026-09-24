@@ -50,8 +50,8 @@ fs.writeFileSync(configPath, `${JSON.stringify({
 
 assert.equal(listListeners().has(scratchPort), false, `验证端口 ${scratchPort} 必须先空闲`)
 
-const { ctx, disposers, invoke } = createFakeSeam({ configPath, stateDir, logDir })
-apply(ctx)
+const { ctx, disposers, invoke, pluginConfig } = createFakeSeam({ configPath, stateDir, logDir })
+apply(ctx, pluginConfig)
 
 try {
   // 1) autostart：加载后端口必须真的起来
