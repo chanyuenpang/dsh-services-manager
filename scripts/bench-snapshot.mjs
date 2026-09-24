@@ -62,3 +62,20 @@ const median = times[Math.floor(times.length / 2)]
 const blocked = [cold, ...warm].filter((item) => item.expected >= 5 && item.ticks <= 1).length
 console.log(`\n中位耗时：${median}ms | 最小 ${times[0]}ms | 最大 ${times[times.length - 1]}ms`)
 console.log(`事件循环被阻塞的轮数：${blocked}/${times.length}（判据：期望 tick ≥5 时实际 ≤1）`)
+
+// 快层：首屏路径 —— 只做本机 TCP 探测 + 读现有详层，不等 netstat/PowerShell。
+console.log('\n--- 快层 mode=fast（首屏路径）---')
+const fastTimes = []
+for (let index = 1; index <= rounds; index += 1) {
+  const started = Date.now()
+  const fastSnapshot = await invoke('snapshot', { mode: 'fast' })
+  const elapsedMs = Date.now() - started
+  fastTimes.push(elapsedMs)
+  const missingPid = fastSnapshot.services.filter((service) => service.pid === null).length
+  console.log(
+    `fast #${index}: ${elapsedMs}ms | stale=${String(fastSnapshot.stale)} refreshing=${String(fastSnapshot.refreshing)}` +
+    ` ageMs=${String(fastSnapshot.ageMs)} | 缺 pid 的服务 ${missingPid}/${fastSnapshot.services.length}`,
+  )
+}
+const fastSorted = [...fastTimes].sort((a, b) => a - b)
+console.log(`快层中位：${fastSorted[Math.floor(fastSorted.length / 2)]}ms | 最小 ${fastSorted[0]}ms | 最大 ${fastSorted[fastSorted.length - 1]}ms`)

@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { launchArgv } from './command.mjs'
 import {
-  commandLines, killTree, listListeners, matchesSignature,
+  commandLines, killTree, listListeners, matchesSignature, tcpProbe,
   waitForPortFree, waitForPortListening,
 } from './probe.mjs'
 import { readConfig, saveConfig } from './config.mjs'
@@ -49,8 +49,21 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
   let revision = 0
   let selfPort = null
   let scheduledRestart = null
+  /**
+   * 详层结果（netstat 的「端口 → pid/命令行」）。快层绝不自己跑 netstat，
+   * 只读这里；缺失就如实显示「读取中」，不猜测。
+   */
+  let detail = null
+  let detailInFlight = null
+  /** 快层 TCP 探测的超时：够本机 loopback 用，且决定首屏最坏耗时。 */
+  const FAST_PROBE_TIMEOUT_MS = 250
+  /** 详层超过这个年龄就在响应里标过期，让客户端知道「当前看到的是旧详情」。 */
+  const DETAIL_STALE_MS = 5000
+  /** 快照模式：'full' 等详层（兼容旧调用），'fast' 立即用现有详层返回。 */
+  const SNAPSHOT_MODES = new Set(['fast', 'full'])
 
   const now = () => new Date().toISOString()
+  const elapsed = (from) => (from === null || from === undefined ? null : Date.now() - from)
 
   function touch() {
     revision += 1
@@ -76,7 +89,14 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     return instance
   }
 
-  /** 本实例监听端口：优先读自己的 PID 在 netstat 里的监听口，其次 --port 参数，最后 3080。 */
+  /** 本实例监听端口：优先 netstat 确认结果，其次 --port 参数，最后 3080（快层不能依赖 netstat）。 */
+  function argvSelfPort() {
+    const index = process.argv.findIndex((arg) => arg === '--port')
+    const explicit = index === -1 ? Number.NaN : Number(process.argv[index + 1])
+    return Number.isInteger(explicit) ? explicit : 3080
+  }
+
+  /** 详层专用：从 netstat 结果里确认「本进程」的监听端口并缓存。 */
   function detectSelfPort(listeners) {
     if (selfPort !== null) return selfPort
     for (const [port, pid] of listeners) {
@@ -85,14 +105,47 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
         return port
       }
     }
-    const index = process.argv.findIndex((arg) => arg === '--port')
-    const explicit = index === -1 ? Number.NaN : Number(process.argv[index + 1])
-    selfPort = Number.isInteger(explicit) ? explicit : 3080
+    selfPort = argvSelfPort()
     return selfPort
   }
 
-  function selfDefinition(listeners) {
-    const port = detectSelfPort(listeners)
+  /** 快层可用的自身端口：已确认值 → argv → 3080。 */
+  function currentSelfPort() {
+    return selfPort ?? argvSelfPort()
+  }
+
+  /**
+   * 详层刷新：一次 netstat + 一次（按 PID 永久缓存的）命令行查询。
+   * 并发调用共享同一个 in-flight promise；失败时保留旧结果（快照会标 stale）。
+   */
+  function refreshDetail() {
+    if (detailInFlight !== null) return detailInFlight
+    detailInFlight = (async () => {
+      try {
+        const listeners = await listListeners()
+        const confirmed = detectSelfPort(listeners)
+        const { list } = definitions()
+        const wantedPorts = [confirmed, ...list.map((definition) => definition.port).filter((port) => port !== null)]
+        const byPort = new Map()
+        for (const port of new Set(wantedPorts)) {
+          const pid = listeners.get(port)
+          if (pid !== undefined) byPort.set(port, { pid, commandLine: '' })
+        }
+        const commandLineMap = await commandLines([...new Set([...byPort.values()].map((entry) => entry.pid))])
+        for (const entry of byPort.values()) entry.commandLine = commandLineMap.get(entry.pid) ?? ''
+        detail = { at: Date.now(), selfPort: confirmed, byPort }
+        touch()
+      } catch {
+        // 保住旧详层：宁可显示带 stale 标记的旧 pid，也不清空成「未知」。
+      } finally {
+        detailInFlight = null
+      }
+      return detail
+    })()
+    return detailInFlight
+  }
+
+  function selfDefinition(port) {
     return {
       id: SELF_ID,
       title: 'DSH Web（本实例）',
@@ -122,29 +175,35 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     const { list } = definitions()
     const found = list.find((definition) => definition.id === id)
     if (found !== undefined) return found
-    if (id === SELF_ID) return selfDefinition(await listListeners())
+    if (id === SELF_ID) return selfDefinition(currentSelfPort())
     throw fail('SERVICE_NOT_FOUND', `没有 id 为 ${id} 的服务定义`, { id, configPath })
   }
 
   /** 观测一条服务的运行态（不修改任何状态）。 */
-  function stateOf(definition, listeners, commandLineMap) {
+  /**
+   * 观测一条服务的运行态（不修改任何状态）。
+   * @param definition - 服务定义
+   * @param fast - 快层结果 `{ running }`（本机 TCP 探测，毫秒级）
+   * @param detailLayer - 详层结果 `{ at, byPort }`，可能为 null（首次）或偏旧
+   */
+  function stateOf(definition, fast, detailLayer) {
     const instance = instances.get(definition.id)
-    const portPid = definition.port === null ? null : listeners.get(definition.port) ?? null
     // handle 的存活由 done 的结算维护；subprocess handle 不暴露子进程 PID，
     // 所以「谁在跑」一律由端口回答，「是不是我启动的」由 handle 是否仍在托管回答。
     const handleAlive = instance?.handle != null && instance?.handleAlive === true
+    const detailEntry = definition.port === null ? null : detailLayer?.byPort?.get(definition.port) ?? null
     let status = 'stopped'
     let ownership = 'none'
     let pid = null
     if (instance?.pending === 'starting' || instance?.pending === 'stopping') {
       status = instance.pending
       ownership = instance.pending === 'stopping' ? 'none' : 'spawned'
-      pid = portPid ?? null
-    } else if (portPid !== null) {
+      pid = detailEntry?.pid ?? null
+    } else if (fast.running === true) {
       status = 'running'
-      // 端口被占 = 在跑；有 handle 且端口属于我们启动的进程 → spawned，否则 discovered。
+      // 端口在应答 = 在跑；有 handle → 是我们启动的，否则是外部进程。
       ownership = instance?.handle != null ? 'spawned' : 'discovered'
-      pid = portPid
+      pid = detailEntry?.pid ?? null
     } else if (instance?.handle != null && handleAlive) {
       status = instance.startedAt !== null && Date.now() - instance.startedAt > START_WAIT_MS ? 'unknown' : 'starting'
       ownership = 'spawned'
@@ -155,7 +214,6 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
       // 只有「不是我们主动停止」造成的非零退出才算异常。
       status = 'error'
     }
-    const commandLine = pid === null ? null : commandLineMap.get(pid) ?? null
     return {
       id: definition.id,
       title: definition.title,
@@ -170,7 +228,7 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
       ownership: definition.self === true ? 'none' : ownership,
       pid: definition.self === true ? process.pid : pid,
       healthy: null,
-      commandLine: definition.self === true ? null : commandLine,
+      commandLine: definition.self === true ? null : detailEntry?.commandLine ?? null,
       lastExit: instance?.lastExit ?? null,
       lastError: instance?.lastError ?? null,
       lastOperation: instance?.lastOperation ?? null,
@@ -179,19 +237,32 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     }
   }
 
-  /** 组装完整快照（读路径）。 */
-  async function snapshot() {
-    const listeners = await listListeners()
+  /**
+   * 组装快照（读路径）。
+   *
+   * 两层：
+   * - **快层**：对每条有端口的服务做本机 TCP 探测（并行、250ms 超时），得到 status/ownership。
+   *   首屏只需要它。
+   * - **详层**：netstat + 按 PID（永久缓存）取命令行，补齐 pid/commandLine；慢且可能失败，
+   *   所以它异步补齐，缺失时如实标 `stale`/`refreshing`，绝不阻塞快层。
+   *
+   * @param {{mode?: 'fast'|'full'}} [options] - `full` 等详层刷新完成（旧调用/显式刷新用），
+   *   `fast`（缺省）立即用现有详层返回并在后台刷新。
+   */
+  async function snapshot(options = {}) {
+    const mode = SNAPSHOT_MODES.has(options.mode) ? options.mode : 'full'
     const { config, list } = definitions()
-    const definitionsAll = [selfDefinition(listeners), ...list]
-    const pids = []
-    for (const definition of definitionsAll) {
-      if (definition.port === null) continue
-      const pid = listeners.get(definition.port)
-      if (pid !== undefined) pids.push(pid)
+    if (mode === 'full') {
+      await refreshDetail()
+    } else if (detail === null || Date.now() - detail.at > DETAIL_STALE_MS) {
+      void refreshDetail()
     }
-    const commandLineMap = await commandLines(pids)
-    const services = definitionsAll.map((definition) => stateOf(definition, listeners, commandLineMap))
+    const refreshing = detailInFlight !== null
+    const definitionsAll = [selfDefinition(currentSelfPort()), ...list]
+    const probes = await Promise.all(definitionsAll.map((definition) => (
+      definition.port === null ? Promise.resolve(false) : tcpProbe(definition.host, definition.port, FAST_PROBE_TIMEOUT_MS)
+    )))
+    const services = definitionsAll.map((definition, index) => stateOf(definition, { running: probes[index] }, detail))
     // 可选 HTTP 健康探测：只在定义里显式配了 probe.path 时进行。
     await Promise.all(services.map(async (service, index) => {
       const probe = definitionsAll[index].probe
@@ -207,14 +278,20 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
       else if (service.status === 'stopped') summary.stopped += 1
       else summary.unknown += 1
     }
+    const ageMs = elapsed(detail?.at)
     return {
-      revision: touch(),
+      revision,
       configPath,
       configRevision: config.revision,
       stateDir,
       configIssues: config.issues,
       summary,
       services,
+      mode,
+      detailAt: detail?.at ?? null,
+      ageMs,
+      stale: mode === 'fast' && (ageMs === null || ageMs > DETAIL_STALE_MS),
+      refreshing,
     }
   }
 
@@ -475,7 +552,7 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
   /** RPC 端点分发（唯一通道 /dsh-services）。 */
   async function handle(endpoint, payload) {
     switch (endpoint) {
-      case 'snapshot': return snapshot()
+      case 'snapshot': return snapshot(payload ?? {})
       case 'start': return start(requireId(payload), payload)
       case 'stop': return stop(requireId(payload), payload)
       case 'restart': return restart(requireId(payload), payload)
