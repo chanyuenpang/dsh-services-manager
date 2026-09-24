@@ -1,0 +1,496 @@
+/**
+ * 服务监管核心：观测快照 + 控制操作。
+ *
+ * 设计约束（与 feature-architecture 报告一致）：
+ * - 活性真相 = 端口 LISTENING（probe.listListeners），不是「PID 存活」；
+ * - 所有权两类：`spawned`（本插件持 handle）/ `discovered`（按端口发现的外部占用者），永不混淆；
+ * - 只有命令行签名匹配的端口占用者才会被终止，否则抛 PORT_OWNED_BY_OTHER；
+ * - 所有控制操作按服务串行化（不变量 8）；
+ * - 运行态不持久化（不变量 1/6）。
+ */
+import { spawn } from 'node:child_process'
+import path from 'node:path'
+import { launchArgv } from './command.mjs'
+import {
+  commandLines, killTree, listListeners, matchesSignature,
+  waitForPortFree, waitForPortListening,
+} from './probe.mjs'
+import { readConfig, saveConfig } from './config.mjs'
+
+/** dsh 自身的保留 id。 */
+export const SELF_ID = 'dsh'
+const START_WAIT_MS = 8000
+const STOP_WAIT_MS = 8000
+/** spawn 出来的服务进程 stdout/stderr 的内存保留窗口与完整落盘上限。 */
+const COLLECT_MAX_BYTES = 65536
+const SPILL_MAX_BYTES = 16 * 1024 * 1024
+const GRACE_MS = 10_000
+
+function fail(code, message, details) {
+  const error = new Error(message)
+  error.code = code
+  if (details !== undefined) error.details = details
+  return error
+}
+
+/**
+ * @param {object} input
+ * @param {import('@deepseek-ai/cordis').Context} input.ctx - 宿主上下文（提供 ctx.subprocess）
+ * @param {string} input.configPath - 配置文件绝对路径
+ * @param {string} input.stateDir - 插件状态目录
+ * @param {string} input.logDir - 日志目录
+ * @param {string} input.supervisorScript - dsh 自重启看守脚本路径
+ */
+export function createManager({ ctx, configPath, stateDir, logDir, supervisorScript }) {
+  /** @type {Map<string, {handle:any, pending:string|null, startedAt:number|null, lastExit:{code:number|null,at:string}|null, lastError:string|null, lastOperation:string|null, updatedAt:string}>} */
+  const instances = new Map()
+  /** 每服务一条串行链：重复点击不会产生并发操作。 */
+  const chains = new Map()
+  let revision = 0
+  let selfPort = null
+  let scheduledRestart = null
+
+  const now = () => new Date().toISOString()
+
+  function touch() {
+    revision += 1
+    return revision
+  }
+
+  function enqueue(id, work) {
+    const previous = chains.get(id) ?? Promise.resolve()
+    const next = previous.then(work, work)
+    chains.set(id, next.then(() => undefined, () => undefined))
+    return next
+  }
+
+  function instanceOf(id) {
+    let instance = instances.get(id)
+    if (instance === undefined) {
+      instance = {
+        handle: null, handleAlive: false, pending: null, startedAt: null,
+        lastExit: null, lastError: null, lastStopAt: null, lastOperation: null, updatedAt: now(),
+      }
+      instances.set(id, instance)
+    }
+    return instance
+  }
+
+  /** 本实例监听端口：优先读自己的 PID 在 netstat 里的监听口，其次 --port 参数，最后 3080。 */
+  function detectSelfPort(listeners) {
+    if (selfPort !== null) return selfPort
+    for (const [port, pid] of listeners) {
+      if (pid === process.pid) {
+        selfPort = port
+        return port
+      }
+    }
+    const index = process.argv.findIndex((arg) => arg === '--port')
+    const explicit = index === -1 ? Number.NaN : Number(process.argv[index + 1])
+    selfPort = Number.isInteger(explicit) ? explicit : 3080
+    return selfPort
+  }
+
+  function selfDefinition(listeners) {
+    const port = detectSelfPort(listeners)
+    return {
+      id: SELF_ID,
+      title: 'DSH Web（本实例）',
+      port,
+      host: '127.0.0.1',
+      url: `http://127.0.0.1:${port}/`,
+      command: [process.execPath, ...process.argv.slice(1)].join(' '),
+      cwd: process.cwd(),
+      env: {},
+      autostart: false,
+      autoStopOnExit: false,
+      probe: { path: null, expectStatus: null, intervalMs: null },
+      match: { commandLinePattern: '@deepseek-ai[\\\\/]dsh[\\\\/]lib[\\\\/]bin\\.js' },
+      restartMode: 'supervisor',
+      takeover: 'match',
+      managed: false,
+      self: true,
+    }
+  }
+
+  function definitions() {
+    const config = readConfig(configPath)
+    return { config, list: config.services.map((definition) => ({ ...definition, managed: true, self: false })) }
+  }
+
+  function findDefinition(id) {
+    const { config, list } = definitions()
+    const found = list.find((definition) => definition.id === id)
+    if (found !== undefined) return found
+    if (id === SELF_ID) return selfDefinition(listListeners())
+    throw fail('SERVICE_NOT_FOUND', `没有 id 为 ${id} 的服务定义`, { id, configPath })
+  }
+
+  /** 观测一条服务的运行态（不修改任何状态）。 */
+  function stateOf(definition, listeners, commandLineMap) {
+    const instance = instances.get(definition.id)
+    const portPid = definition.port === null ? null : listeners.get(definition.port) ?? null
+    // handle 的存活由 done 的结算维护；subprocess handle 不暴露子进程 PID，
+    // 所以「谁在跑」一律由端口回答，「是不是我启动的」由 handle 是否仍在托管回答。
+    const handleAlive = instance?.handle != null && instance?.handleAlive === true
+    let status = 'stopped'
+    let ownership = 'none'
+    let pid = null
+    if (instance?.pending === 'starting' || instance?.pending === 'stopping') {
+      status = instance.pending
+      ownership = instance.pending === 'stopping' ? 'none' : 'spawned'
+      pid = portPid ?? null
+    } else if (portPid !== null) {
+      status = 'running'
+      // 端口被占 = 在跑；有 handle 且端口属于我们启动的进程 → spawned，否则 discovered。
+      ownership = instance?.handle != null ? 'spawned' : 'discovered'
+      pid = portPid
+    } else if (instance?.handle != null && handleAlive) {
+      status = instance.startedAt !== null && Date.now() - instance.startedAt > START_WAIT_MS ? 'unknown' : 'starting'
+      ownership = 'spawned'
+    } else if (instance?.lastError !== null && instance?.lastError !== undefined) {
+      status = 'error'
+    } else if (instance?.lastExit !== null && instance?.lastExit !== undefined && instance.lastExit.code !== 0
+      && instance?.lastStopAt === null) {
+      // 只有「不是我们主动停止」造成的非零退出才算异常。
+      status = 'error'
+    }
+    const commandLine = pid === null ? null : commandLineMap.get(pid) ?? null
+    return {
+      id: definition.id,
+      title: definition.title,
+      port: definition.port,
+      host: definition.host,
+      url: definition.url,
+      autostart: definition.autostart,
+      autoStopOnExit: definition.autoStopOnExit,
+      restartMode: definition.restartMode,
+      takeover: definition.takeover,
+      status,
+      ownership: definition.self === true ? 'none' : ownership,
+      pid: definition.self === true ? process.pid : pid,
+      healthy: null,
+      commandLine: definition.self === true ? null : commandLine,
+      lastExit: instance?.lastExit ?? null,
+      lastError: instance?.lastError ?? null,
+      lastOperation: instance?.lastOperation ?? null,
+      updatedAt: instance?.updatedAt ?? now(),
+      managed: definition.managed !== false,
+    }
+  }
+
+  /** 组装完整快照（读路径）。 */
+  async function snapshot() {
+    const listeners = listListeners()
+    const { config, list } = definitions()
+    const definitionsAll = [selfDefinition(listeners), ...list]
+    const pids = []
+    for (const definition of definitionsAll) {
+      if (definition.port === null) continue
+      const pid = listeners.get(definition.port)
+      if (pid !== undefined) pids.push(pid)
+    }
+    const commandLineMap = commandLines(pids)
+    const services = definitionsAll.map((definition) => stateOf(definition, listeners, commandLineMap))
+    // 可选 HTTP 健康探测：只在定义里显式配了 probe.path 时进行。
+    await Promise.all(services.map(async (service, index) => {
+      const probe = definitionsAll[index].probe
+      if (probe?.path == null || service.port === null || service.status !== 'running') return
+      const { httpProbe } = await import('./probe.mjs')
+      const result = await httpProbe(service.host, service.port, probe.path, probe.expectStatus)
+      service.healthy = result.healthy
+    }))
+    const summary = { total: services.length, running: 0, stopped: 0, error: 0, unknown: 0 }
+    for (const service of services) {
+      if (service.status === 'running') summary.running += 1
+      else if (service.status === 'error') summary.error += 1
+      else if (service.status === 'stopped') summary.stopped += 1
+      else summary.unknown += 1
+    }
+    return {
+      revision: touch(),
+      configPath,
+      configRevision: config.revision,
+      stateDir,
+      configIssues: config.issues,
+      summary,
+      services,
+    }
+  }
+
+  function stateDirReady() {
+    // 目录由 config/probe 各自按需创建；此处只保证日志目录存在。
+    return logDir
+  }
+
+  /** 启动一条服务（幂等：已在监听则原样返回快照）。 */
+  async function start(id, options = {}) {
+    return enqueue(id, async () => {
+      const definition = findDefinition(id)
+      if (definition.self === true) throw fail('OPERATION_FAILED', 'dsh 自身已在运行；请使用「重启 DSH」。')
+      const listeners = listListeners()
+      const instance = instanceOf(id)
+      if (definition.port !== null && listeners.has(definition.port)) {
+        // 端口已在监听：不重启、不接管，如实返回当前状态。
+        return snapshot()
+      }
+      if (instance.handle != null && instance.handleAlive !== false) {
+        // 已有我们启动的实例：视为幂等重复调用。
+        return snapshot()
+      }
+      instance.pending = 'starting'
+      instance.lastError = null
+      instance.lastStopAt = null
+      instance.lastOperation = 'start'
+      instance.updatedAt = now()
+      try {
+        const handle = ctx.subprocess.spawn({
+          argv: launchArgv(definition.command),
+          cwd: definition.cwd,
+          env: { ...definition.env },
+          stdio: {
+            stdin: 'ignore',
+            stdout: { mode: 'collect', maxBytes: COLLECT_MAX_BYTES, spill: { maxBytes: SPILL_MAX_BYTES } },
+            stderr: { mode: 'collect', maxBytes: COLLECT_MAX_BYTES, spill: { maxBytes: SPILL_MAX_BYTES } },
+          },
+          graceMs: GRACE_MS,
+        })
+        instance.handle = handle
+        instance.handleAlive = true
+        instance.startedAt = Date.now()
+        instance.pending = 'starting'
+        handle.done.then((outcome) => {
+          instance.handleAlive = false
+          instance.lastExit = { code: outcome.exitCode, at: now() }
+          // 我们主动 stop 造成的非零退出不是异常（lastStopAt 在 start 时清空）。
+          if (outcome.exitCode !== 0 && outcome.exitCode !== null && instance.lastStopAt === null) {
+            instance.lastError = `进程退出，退出码 ${outcome.exitCode}`
+          }
+          instance.updatedAt = now()
+        }).catch((error) => {
+          instance.handleAlive = false
+          instance.lastError = `子进程失败：${String(error?.message ?? error)}`
+          instance.updatedAt = now()
+        })
+      } catch (error) {
+        instance.pending = null
+        instance.lastError = `启动失败：${String(error?.message ?? error)}`
+        instance.lastOperation = 'start'
+        instance.updatedAt = now()
+        throw fail('OPERATION_FAILED', instance.lastError)
+      }
+      instance.pending = null
+      instance.updatedAt = now()
+      if (definition.port !== null) {
+        const listening = await waitForPortListening(definition.port, { timeoutMs: START_WAIT_MS })
+        if (!listening) {
+          instance.lastError = `启动后 ${START_WAIT_MS}ms 内端口 ${definition.port} 未进入监听`
+          instance.updatedAt = now()
+        }
+      }
+      stateDirReady()
+      return snapshot()
+    })
+  }
+
+  /** 停止一条服务：先收自己的 handle，再按端口 + 签名接管外部占用者。 */
+  async function stop(id, options = {}) {
+    return enqueue(id, async () => {
+      const definition = findDefinition(id)
+      if (definition.self === true) {
+        throw fail('OPERATION_FAILED', '不能停止 dsh 自身（那会终止承载本页面的进程）；请使用「重启 DSH」。')
+      }
+      const instance = instanceOf(id)
+      instance.pending = 'stopping'
+      instance.lastOperation = 'stop'
+      instance.lastStopAt = now()
+      instance.updatedAt = now()
+      try {
+        if (instance.handle != null) {
+          instance.handle.terminate()
+          try {
+            await instance.handle.waitForExit(AbortSignal.timeout(STOP_WAIT_MS))
+          } catch {
+            // 观察不到托管范围时继续走端口接管路径，不吞掉失败（下面会如实上报）。
+          }
+          instance.handleAlive = false
+        }
+        if (definition.port !== null) {
+          let pid = listListeners().get(definition.port)
+          if (pid !== undefined) {
+            const signatureMatched = matchesSignature(commandLines([pid]).get(pid) ?? '', definition.match?.commandLinePattern)
+            const allowed = options.force === true || definition.takeover === 'force' || signatureMatched
+            if (!allowed) {
+              throw fail('PORT_OWNED_BY_OTHER',
+                `端口 ${definition.port} 被一个签名不匹配的进程占用（pid ${pid}），已拒绝终止。`,
+                { port: definition.port, pid, commandLine: commandLines([pid]).get(pid) ?? '', pattern: definition.match?.commandLinePattern ?? '' })
+            }
+            killTree(pid)
+            const free = await waitForPortFree(definition.port, { timeoutMs: STOP_WAIT_MS })
+            if (!free) {
+              instance.lastError = `已发出终止命令，但 ${STOP_WAIT_MS}ms 内端口 ${definition.port} 仍未释放（pid ${pid}）`
+              throw fail('TIMEOUT', instance.lastError, { port: definition.port, pid })
+            }
+          }
+        }
+        instance.lastError = null
+      } finally {
+        instance.pending = null
+        instance.updatedAt = now()
+      }
+      return snapshot()
+    })
+  }
+
+  /** 重启一条服务：stop → start（dsh 自身走看守进程）。 */
+  async function restart(id, options = {}) {
+    const definition = findDefinition(id)
+    if (definition.self === true || definition.restartMode === 'supervisor') {
+      return scheduleDshRestart(options)
+    }
+    await stop(id, options)
+    return start(id, options)
+  }
+
+  /**
+   * 安排 dsh 自我重启：分离看守进程（复用 dsh-restart skill 的已验证形态）。
+   * grace 不可静默为 0：默认 60s，下限 15s。
+   */
+  async function scheduleDshRestart(options = {}) {
+    const stamp = Date.now()
+    if (scheduledRestart !== null && stamp < scheduledRestart.executeAt + 60_000) {
+      throw fail('ALREADY_SCHEDULED', '已经安排过一次 dsh 重启，不会重复启动看守进程。', {
+        scheduledAt: scheduledRestart.scheduledAt,
+        graceMs: scheduledRestart.graceMs,
+      })
+    }
+    const listeners = listListeners()
+    const port = detectSelfPort(listeners)
+    const requested = Number(options.graceSeconds ?? 60)
+    const graceSeconds = Number.isFinite(requested) ? Math.min(Math.max(Math.trunc(requested), 15), 3600) : 60
+    const args = [
+      supervisorScript,
+      '--apply',
+      '--grace', String(graceSeconds),
+      '--port', String(port),
+      '--cwd', process.cwd(),
+      '--log-dir', logDir,
+    ]
+    if (options.keepSandboxes === true) args.push('--keep-sandboxes')
+    const child = spawn(process.execPath, args, {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: 'ignore',
+      detached: true,
+      windowsHide: true,
+    })
+    child.unref()
+    scheduledRestart = {
+      scheduledAt: now(),
+      executeAt: stamp + graceSeconds * 1000,
+      graceMs: graceSeconds * 1000,
+      logPath: path.join(logDir, 'host-restart.log'),
+      port,
+    }
+    return {
+      accepted: true,
+      graceMs: scheduledRestart.graceMs,
+      logPath: scheduledRestart.logPath,
+      scheduledAt: scheduledRestart.scheduledAt,
+      port,
+    }
+  }
+
+  /** 读取一条服务的最近输出（collect 模式的 tail + spill 路径）。 */
+  async function logs(id, options = {}) {
+    const instance = instances.get(id)
+    if (instance?.handle == null) return { id, path: null, text: '' }
+    const lines = Number.isInteger(options.lines) ? Math.min(Math.max(options.lines, 1), 2000) : 200
+    const stdout = instance.handle.collected?.stdout?.readFrom(0)
+    const stderr = instance.handle.collected?.stderr?.readFrom(0)
+    const tail = (text) => {
+      const rows = String(text ?? '').split(/\r?\n/)
+      return rows.slice(Math.max(0, rows.length - lines)).join('\n')
+    }
+    const parts = []
+    if (stdout?.text) parts.push(tail(stdout.text))
+    if (stderr?.text) parts.push(`--- stderr ---\n${tail(stderr.text)}`)
+    return { id, path: stdout?.spillPath ?? stderr?.spillPath ?? null, text: parts.join('\n\n') }
+  }
+
+  /** 读取配置原文（面板编辑器用）。 */
+  async function configGet() {
+    const config = readConfig(configPath)
+    return { path: configPath, revision: config.revision, raw: config.raw }
+  }
+
+  /** 写回配置（原子 + expectedRevision）。 */
+  async function configSet(payload = {}) {
+    if (typeof payload.raw !== 'string') throw fail('CONFIG_INVALID', 'config.set 需要 raw 文本')
+    const result = saveConfig(configPath, payload.raw, payload.expectedRevision)
+    touch()
+    return { path: result.path, revision: result.revision, raw: result.raw }
+  }
+
+  /** dsh 启动时拉起 autostart 项；失败只记录，不阻塞其它服务。 */
+  async function autostart() {
+    let list = []
+    try {
+      list = definitions().list
+    } catch (error) {
+      console.warn(`[dsh-services-manager] 读取配置失败：${String(error?.message ?? error)}`)
+      return
+    }
+    for (const definition of list) {
+      if (definition.autostart !== true) continue
+      try {
+        await start(definition.id, {})
+        console.log(`[dsh-services-manager] autostart 已拉起 ${definition.id}`)
+      } catch (error) {
+        console.warn(`[dsh-services-manager] autostart 失败 ${definition.id}：${String(error?.message ?? error)}`)
+      }
+    }
+  }
+
+  /** 插件卸载（dsh 退出/重启）时停止本插件启动的实例。 */
+  async function dispose() {
+    const { list } = (() => {
+      try {
+        return definitions()
+      } catch {
+        return { list: [] }
+      }
+    })()
+    const autoStopIds = new Set(list.filter((definition) => definition.autoStopOnExit !== false).map((definition) => definition.id))
+    for (const [id, instance] of instances) {
+      if (instance.handle == null) continue
+      if (!autoStopIds.has(id)) continue
+      try {
+        instance.handle.terminate()
+      } catch { /* 托管范围可能已消失 */ }
+    }
+  }
+
+  /** RPC 端点分发（唯一通道 /dsh-services）。 */
+  async function handle(endpoint, payload) {
+    switch (endpoint) {
+      case 'snapshot': return snapshot()
+      case 'start': return start(requireId(payload), payload)
+      case 'stop': return stop(requireId(payload), payload)
+      case 'restart': return restart(requireId(payload), payload)
+      case 'restart-dsh': return scheduleDshRestart(payload)
+      case 'config.get': return configGet()
+      case 'config.set': return configSet(payload)
+      case 'logs': return logs(requireId(payload), payload)
+      default: throw fail('UNKNOWN_ENDPOINT', `未知端点 ${endpoint}`)
+    }
+  }
+
+  function requireId(payload) {
+    const id = typeof payload?.id === 'string' ? payload.id : ''
+    if (id === '') throw fail('SERVICE_NOT_FOUND', '缺少服务 id')
+    return id
+  }
+
+  return { handle, snapshot, start, stop, restart, autostart, dispose, scheduleDshRestart, configPath, logDir }
+}

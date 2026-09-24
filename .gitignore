@@ -5,3 +5,9 @@
 !.claw/truth/**
 .claw/project-override.json
 .gitnexus
+# 沙箱测试用的隔离 DSH_HOME（绝不入库）
+.sandbox/
+node_modules/
+
+# DSH 写入工具的原子写临时目录
+*.tmpdir/

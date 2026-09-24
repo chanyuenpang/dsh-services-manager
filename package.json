@@ -1,0 +1,44 @@
+{
+  "name": "dsh-services-manager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 设置页的「服务管理」分区：查看/启动/停止/重启/刷新宿主后台网络服务，并支持一键重启 dsh 自身。",
+  "keywords": ["dsh", "deepseek-harness", "cordis-plugin", "services"],
+  "license": "MIT",
+  "main": "src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/",
+    "lib/",
+    "docs/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "verify-host": "node scripts/verify-host.mjs"
+  }
+}

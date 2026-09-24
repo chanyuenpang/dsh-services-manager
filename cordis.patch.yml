@@ -1,0 +1,18 @@
+# dsh-services-manager 的 DSH bundle：一行 host 插件。
+# 浏览器半边由 package.json 的 exports["./client"] 提供，向设置页注册「服务管理」分区。
+#
+# 安装：
+#   1. dsh plugin --profile web add G:/Projects/dsh-plugins/dsh-services-manager
+#      （会同时加依赖并把包名写进该 profile 的 dsh.profile.bundles）
+#   2. 确认该 profile 的 cordis.patch.yml 里有下面这一段 —— 本插件走
+#      `connection.rpc.handle` 注册 RPC 面，而这条通道需要 connection 行注入 webServer：
+#          - id: connection
+#            inject:
+#              - webRuntime
+#              - webServer
+#      （本机正式的 web profile 早就有这两行；新建的 profile 必须补上，否则插件加载即失败：
+#        `cannot get property "webServer" without inject`，整个 profile 树都起不来）
+#   3. 重启 dsh：composition 与 bundle patch 只在进程启动时加载。
+- insert:
+    - id: dsh-services-manager
+      name: dsh-services-manager
