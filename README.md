@@ -107,7 +107,12 @@ node scripts/verify-host.mjs 4599   # 真机验证：不重启 dsh，用最小 s
 node scripts/verify-lifecycle.mjs 4598  # autostart 拉起 → restart 换 PID → dispose 释放端口
 node scripts/verify-rpc-http.mjs "<token url>"  # 真实 HTTP 层：信封字段 + 快层首屏耗时
 node scripts/bench-snapshot.mjs 5   # 快照耗时基线 + 「事件循环是否被阻塞」的客观测法
+pwsh -File scripts/preview-sandbox.ps1        # 起隔离沙箱并在终端打印预览地址（只碰 3099 / .sandbox）
+pwsh -File scripts/preview-sandbox.ps1 -Stop  # 看完停掉
 ```
+
+> 改**客户端**（`lib/client.js`）后刷新预览页即可生效；改**宿主**（`src/**`）必须重启实例，且按
+> `AGENTS.md` 先过沙箱门禁 4 项才允许挂正式 profile。
 
 `scripts/verify-host.mjs` 会核对：`snapshot` 与本机 `netstat` 逐行一致、配置冲突/非法被拒、
 真实启动一个临时 HTTP 服务（端口真的起来、PID 可读、日志可取）、停止后端口真的释放、
