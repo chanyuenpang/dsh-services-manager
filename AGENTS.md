@@ -47,6 +47,10 @@ dsh --profile sandbox --port 3099 --no-open *> "$sandbox\..\logs\sandbox-web.log
 - 沙箱实例用完停掉，不要长期占着 3099。
 - 不要为了省事把沙箱 profile 指向正式 `DSH_HOME`；那等于没隔离。
 
+> **危险：绝不要在沙箱里真的触发重启。** `restart-supervisor` 的清扫名单是按「**本次 DSH 安装**」识别的
+> （命令行里含 `@deepseek-ai/dsh/` 路径标记），不是按实例识别。对沙箱实例执行重启，会连带杀掉**正式实例的整棵进程树**
+> ——包括承载你当前对话的那一个。要验证重启链路，请用「长 grace 调度 + 立刻杀掉看守」，或至少加 `--keep-sandboxes`。
+
 ## 已踩过的坑（重跑沙箱的价值就在这里）
 
 | 症状 | 根因 | 正确做法 |
@@ -55,10 +59,14 @@ dsh --profile sandbox --port 3099 --no-open *> "$sandbox\..\logs\sandbox-web.log
 | `cannot get property "webServer" without inject`，整个 profile 起不来 | `connection.rpc.handle` 需要 **`connection` 行**注入 `webServer`/`webRuntime`；随包模板里没有，正式 profile 靠 patch 补 | 在该 profile 的 `cordis.patch.yml` 加 `- id: connection` + `inject: [webRuntime, webServer]`。**沙箱 profile 也必须加**（新建 profile 最容易漏这一步）。注意不是给自己的插件行加 inject —— 实测给 `dsh-services-manager` 行加 `inject: [webServer]` 无效 |
 | `Cannot find module '…\"…scratch-server.mjs\"'` | 把整条 shell 命令当成**单个** argv 元素交给 `cmd.exe`：Node 会给它整体加引号并把内部引号转义成 `\"`，cmd 不认 | 引用感知分词后把参数各自独立传：`cmd.exe /d /s /c <程序> <参数…>`（见 `src/command.mjs`） |
 | 主动 `stop` 之后状态显示 `error` | 被 terminate 的进程退出码非零，被当成崩溃 | 记录 `lastStopAt`，只有「不是我们主动停止」造成的非零退出才算异常 |
+| 用 CIM 过滤器批量杀进程时**把自己的命令树也杀了**（job runner exit 1） | 过滤器的关键字出现在执行它的 runner/pwsh 自己的命令行里（命令行 = 脚本正文），于是自我匹配 | 拼接避开连续关键字（例如 `'--' + 'supervise'`），或先查出 PID 再按 PID 精确杀 |
+| 面板每个操作都报 `Cannot read properties of undefined (reading 'raw')` | 宿主 RPC 信封字段写成了 `data`；传输层按 schema 校验会**剥掉未知键**，浏览器只收到 `{ok:true}` | 信封必须是 `{ok:true, value}` / `{ok:false, error:{code,message,details}}`（`details` 必填对象）。这条只有真正跑 HTTP 层才暴露 —— 见下条验证方式 |
 
 ## 其它约定
 
 - 单测：`npm test`（netstat 解析、签名正反例、配置校验/原子写/冲突、命令分词）。
 - 真机验证（不重启 dsh）：`node scripts/verify-host.mjs 4599`、`node scripts/verify-lifecycle.mjs 4598`。
+- **HTTP 层验证（信封/真实传输，唯一能抓到字段错误的一层）**：`node scripts/verify-rpc-http.mjs "<token url>"`；
+  token 在 `<DSH_HOME>/.dsh-services-manager/logs/dsh-web.log` 最后一行，或浏览器地址栏。只读端点，不碰重启。
 - 活性判定只认端口 LISTENING；终止外部进程前必须过命令行签名校验（`match.commandLinePattern`）。
 - 服务定义的唯一事实来源是 `<DSH_HOME>/.dsh-services-manager/services.json`，运行态绝不写回。
