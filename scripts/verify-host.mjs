@@ -117,7 +117,7 @@ async function refusal(endpoint, payload) {
 
 try {
   // 1) 真实基线：snapshot 必须与 netstat 一致
-  const listeners = listListeners()
+  const listeners = await listListeners()
   const snapshot = await invoke('snapshot')
   record('snapshot', {
     revision: snapshot.revision,
@@ -169,26 +169,26 @@ try {
   assert.equal(listeners.has(scratchPort), false, `验证端口 ${scratchPort} 必须先空闲（否则先停掉它）`)
   const started = await invoke('start', { id: 'scratch' })
   const scratchRunning = started.services.find((service) => service.id === 'scratch')
-  const afterStart = listListeners()
+  const afterStart = await listListeners()
   const startLogs = await invoke('logs', { id: 'scratch', lines: 40 })
   record('start.raw', { ...brief(scratchRunning), listening: afterStart.has(scratchPort), output: startLogs.text.slice(0, 400) })
   assert.equal(afterStart.has(scratchPort), true, `start 之后端口必须进入监听（状态 ${scratchRunning.status}，lastError ${scratchRunning.lastError}）`)
   scratchPid = afterStart.get(scratchPort)
   assert.equal(scratchRunning.status, 'running')
   assert.equal(scratchRunning.ownership, 'spawned')
-  record('start', { ...brief(scratchRunning), commandLine: commandLines([scratchPid]).get(scratchPid) })
+  record('start', { ...brief(scratchRunning), commandLine: (await commandLines([scratchPid])).get(scratchPid) })
   const logs = await invoke('logs', { id: 'scratch', lines: 20 })
   record('logs', { path: logs.path, text: logs.text.trim().slice(0, 200) })
 
   // 4) stop：真实端口必须释放，且我们主动停止不算异常
   const stopped = await invoke('stop', { id: 'scratch' })
   const scratchStopped = stopped.services.find((service) => service.id === 'scratch')
-  assert.equal(listListeners().has(scratchPort), false, 'stop 之后端口必须释放')
+  assert.equal((await listListeners()).has(scratchPort), false, 'stop 之后端口必须释放')
   assert.equal(scratchStopped.status, 'stopped', '主动停止后状态必须是 stopped（不是 error）')
   record('stop', brief(scratchStopped))
 
   // 5) 签名不匹配：拒绝终止且进程必须存活（借本机 4173 上的无关服务，只读不改）
-  const unrelatedPid = listListeners().get(unrelatedPort)
+  const unrelatedPid = (await listListeners()).get(unrelatedPort)
   if (unrelatedPid !== undefined) {
     const guardRaw = JSON.stringify({
       version: 1,
@@ -204,7 +204,7 @@ try {
     const guardSaved = await invoke('config.set', { raw: guardRaw, expectedRevision: saved.revision })
     const denied = await refusal('stop', { id: 'guard' })
     assert.equal(denied?.code, 'PORT_OWNED_BY_OTHER', '签名不匹配必须返回 PORT_OWNED_BY_OTHER')
-    assert.equal(listListeners().get(unrelatedPort), unrelatedPid, '签名不匹配时不得终止该进程')
+    assert.equal((await listListeners()).get(unrelatedPort), unrelatedPid, '签名不匹配时不得终止该进程')
     record('stop.refused', {
       code: denied.code, port: unrelatedPort, pidKeptAlive: unrelatedPid,
       details: { pid: denied.details?.pid, pattern: denied.details?.pattern },
@@ -217,7 +217,7 @@ try {
   console.log('PASS')
 } finally {
   // 收尾：把验证用端口清干净（失败路径也要清），并释放 effect。
-  const leftover = listListeners().get(scratchPort)
+  const leftover = (await listListeners()).get(scratchPort)
   if (leftover !== undefined) {
     spawn('taskkill', ['/PID', String(leftover), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
   }

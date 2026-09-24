@@ -1,16 +1,26 @@
 /**
  * 平台探测：端口监听者、进程命令行、命令行签名校验、终止进程树。
  *
- * 这里只做一次性查询，不持有任何业务状态（状态归 supervisor）。
- * 活性判定以「端口是否在 LISTENING」为唯一真相（设计不变量 3）：
- * 不依赖我们是否见过该进程的启动过程——mechanics / tiny-world 都是别人启动的。
+ * 设计约束（v2）：
+ * - **全部异步**：旧实现用 `execFileSync` 跑 netstat/PowerShell，会把宿主事件循环整个卡住
+ *   （实测一次 snapshot 期间 10ms 定时器 0 次触发）。这里一律 `execFile` + Promise。
+ * - **命令行按 PID 永久缓存**：同一 PID 的命令行不会变；旧实现 10s TTL 让 4s 轮询反复付出
+ *   PowerShell 冷启动成本（实测约 1.8s）。
+ * - 并发请求会**合并成一次** PowerShell 调用（micro-batch），避免同一时刻重复起进程。
+ * - 活性判定的快层用 `tcpProbe`（毫秒级），PID/命令行属于详层，见 supervisor 的两层快照。
  */
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import net from 'node:net'
+import { promisify } from 'node:util'
 
-/** 命令行查询缓存：同一轮 snapshot 里多个服务共用一次 PowerShell 调用。 */
+const run = promisify(execFile)
+
+/** 命令行缓存：pid → 命令行（'' 表示该 PID 查不到，通常是已退出）。 */
 const commandLineCache = new Map()
-const CMDLINE_TTL_MS = 10_000
+/** 微批处理状态：把同一 tick 内的多批 PID 合成一次 PowerShell 调用。 */
+let batchPids = new Set()
+let batchPromise = null
+const COMMAND_LINE_CACHE_LIMIT = 1024
 
 /**
  * 解析 `netstat -ano -p TCP` 输出中的 LISTENING 行（纯函数，便于单测）。
@@ -34,65 +44,96 @@ export function parseListenerLines(output) {
 }
 
 /**
- * `netstat -ano -p TCP` 的 LISTENING 行 → `Map<port, pid>`。
- * @returns {Map<number, number>} 端口 → 占用者 PID
+ * `netstat -ano -p TCP` 的 LISTENING 行 → `Map<port, pid>`（异步，不阻塞事件循环）。
+ * @returns {Promise<Map<number, number>>} 端口 → 占用者 PID
  */
-export function listListeners() {
-  let output = ''
+export async function listListeners({ timeoutMs = 8000 } = {}) {
   try {
-    output = execFileSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8', windowsHide: true, timeout: 8000 })
+    const { stdout } = await run('netstat', ['-ano', '-p', 'TCP'], {
+      encoding: 'utf8', windowsHide: true, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024,
+    })
+    return parseListenerLines(stdout)
   } catch {
     return new Map()
   }
-  return parseListenerLines(output)
+}
+
+/** 执行一次批量命令行查询；同一批 PID 合并在一次 PowerShell 调用里。 */
+async function fetchCommandLines(pids) {
+  const fetched = new Map()
+  if (pids.length === 0) return fetched
+  const filter = pids.map((pid) => `ProcessId=${pid}`).join(' or ')
+  const script = `Get-CimInstance Win32_Process -Filter "${filter}" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`
+  try {
+    const { stdout } = await run('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8', windowsHide: true, timeout: 15_000, maxBuffer: 8 * 1024 * 1024,
+    })
+    const parsed = JSON.parse(stdout.trim() || 'null')
+    const rows = parsed === null ? [] : Array.isArray(parsed) ? parsed : [parsed]
+    for (const row of rows) {
+      const pid = Number(row?.ProcessId)
+      if (!Number.isInteger(pid)) continue
+      fetched.set(pid, typeof row?.CommandLine === 'string' ? row.CommandLine : '')
+    }
+  } catch {
+    // 整批失败时不缓存任何结果：调用方会在重试里再试一次，最后以 '' 兜底。
+  }
+  return fetched
+}
+
+/** 把 PID 加入当前 micro-batch，并等待该批次的结果（本 tick 内的请求共享一次调用）。 */
+function scheduleCommandLines(pids) {
+  for (const pid of pids) batchPids.add(pid)
+  if (batchPromise === null) {
+    batchPromise = new Promise((resolve) => { setTimeout(resolve, 0) }).then(async () => {
+      const batch = [...batchPids]
+      batchPids = new Set()
+      batchPromise = null
+      const fetched = await fetchCommandLines(batch)
+      for (const [pid, value] of fetched) {
+        if (commandLineCache.size >= COMMAND_LINE_CACHE_LIMIT) {
+          const oldest = commandLineCache.keys().next().value
+          commandLineCache.delete(oldest)
+        }
+        commandLineCache.set(pid, value)
+      }
+      return fetched
+    })
+  }
+  return batchPromise
 }
 
 /**
- * 批量读取进程命令行（一次 PowerShell 调用），带 TTL 缓存。
+ * 批量读取进程命令行（异步、按 PID 永久缓存、并发合并）。
  * @param {number[]} pids
- * @returns {Map<number, string>}
+ * @returns {Promise<Map<number, string>>} 查不到的 PID 映射为 ''（通常是进程已退出）
  */
-export function commandLines(pids) {
-  const now = Date.now()
+export async function commandLines(pids) {
   const wanted = [...new Set(pids.filter((pid) => Number.isInteger(pid) && pid > 0))]
   const result = new Map()
-  const missing = []
+  let pending = []
   for (const pid of wanted) {
-    const cached = commandLineCache.get(pid)
-    if (cached !== undefined && now - cached.at < CMDLINE_TTL_MS) result.set(pid, cached.value)
-    else missing.push(pid)
+    if (commandLineCache.has(pid)) result.set(pid, commandLineCache.get(pid))
+    else pending.push(pid)
   }
-  if (missing.length === 0) return result
-  const filter = missing.map((pid) => `ProcessId=${pid}`).join(' or ')
-  const script = `Get-CimInstance Win32_Process -Filter "${filter}" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`
-  let parsed = null
-  try {
-    const output = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
-      encoding: 'utf8', windowsHide: true, timeout: 12_000,
+  // 最多两轮：第一轮可能只赶上别人的批次，第二轮为本批新起的调用补齐。
+  for (let attempt = 0; attempt < 2 && pending.length > 0; attempt += 1) {
+    const fetched = await scheduleCommandLines(pending)
+    pending = pending.filter((pid) => {
+      if (fetched.has(pid) || commandLineCache.has(pid)) {
+        result.set(pid, fetched.get(pid) ?? commandLineCache.get(pid) ?? '')
+        return false
+      }
+      return true
     })
-    parsed = JSON.parse(output.trim() || 'null')
-  } catch {
-    parsed = null
   }
-  const rows = parsed === null ? [] : Array.isArray(parsed) ? parsed : [parsed]
-  for (const row of rows) {
-    const pid = Number(row?.ProcessId)
-    const value = typeof row?.CommandLine === 'string' ? row.CommandLine : ''
-    if (!Number.isInteger(pid)) continue
-    commandLineCache.set(pid, { value, at: now })
-    result.set(pid, value)
-  }
-  // 查不到的 PID 记为空串，避免每轮都重复调用 PowerShell。
-  for (const pid of missing) {
-    if (!result.has(pid)) {
-      commandLineCache.set(pid, { value: '', at: now })
-      result.set(pid, '')
-    }
-  }
-  if (commandLineCache.size > 256) {
-    for (const [pid, entry] of commandLineCache) if (now - entry.at > CMDLINE_TTL_MS) commandLineCache.delete(pid)
-  }
+  for (const pid of pending) result.set(pid, '')
   return result
+}
+
+/** 仅供测试/诊断：当前命令行缓存条数。 */
+export function commandLineCacheSize() {
+  return commandLineCache.size
 }
 
 /**
@@ -123,18 +164,18 @@ export function isAlive(pid) {
   }
 }
 
-/** 终止整棵进程树（Windows：taskkill /T）。返回是否执行成功。 */
-export function killTree(pid) {
+/** 终止整棵进程树（Windows：taskkill /T）。异步，不阻塞事件循环。 */
+export async function killTree(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try {
-    execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { encoding: 'utf8', windowsHide: true, timeout: 10_000 })
+    await run('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 10_000, encoding: 'utf8' })
     return true
   } catch {
     return false
   }
 }
 
-/** TCP 连接探测：端口是否真的接受连接（比「PID 存活」更贴近用户语义）。 */
+/** TCP 连接探测：端口是否真的接受连接（比「PID 存活」更贴近用户语义，且毫秒级）。 */
 export function tcpProbe(host, port, timeoutMs = 1200) {
   return new Promise((resolve) => {
     const socket = net.connect({ host, port })
@@ -177,7 +218,7 @@ export async function httpProbe(host, port, pathName = '/', expectStatus, timeou
 export async function waitForPortFree(port, { timeoutMs = 6000, intervalMs = 250 } = {}) {
   const deadline = Date.now() + timeoutMs
   for (;;) {
-    if (!listListeners().has(port)) return true
+    if (!(await listListeners()).has(port)) return true
     if (Date.now() >= deadline) return false
     await new Promise((done) => setTimeout(done, intervalMs))
   }
@@ -187,7 +228,7 @@ export async function waitForPortFree(port, { timeoutMs = 6000, intervalMs = 250
 export async function waitForPortListening(port, { timeoutMs = 8000, intervalMs = 250 } = {}) {
   const deadline = Date.now() + timeoutMs
   for (;;) {
-    if (listListeners().has(port)) return true
+    if ((await listListeners()).has(port)) return true
     if (Date.now() >= deadline) return false
     await new Promise((done) => setTimeout(done, intervalMs))
   }

@@ -118,11 +118,11 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     return { config, list: config.services.map((definition) => ({ ...definition, managed: true, self: false })) }
   }
 
-  function findDefinition(id) {
-    const { config, list } = definitions()
+  async function findDefinition(id) {
+    const { list } = definitions()
     const found = list.find((definition) => definition.id === id)
     if (found !== undefined) return found
-    if (id === SELF_ID) return selfDefinition(listListeners())
+    if (id === SELF_ID) return selfDefinition(await listListeners())
     throw fail('SERVICE_NOT_FOUND', `没有 id 为 ${id} 的服务定义`, { id, configPath })
   }
 
@@ -181,7 +181,7 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
 
   /** 组装完整快照（读路径）。 */
   async function snapshot() {
-    const listeners = listListeners()
+    const listeners = await listListeners()
     const { config, list } = definitions()
     const definitionsAll = [selfDefinition(listeners), ...list]
     const pids = []
@@ -190,7 +190,7 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
       const pid = listeners.get(definition.port)
       if (pid !== undefined) pids.push(pid)
     }
-    const commandLineMap = commandLines(pids)
+    const commandLineMap = await commandLines(pids)
     const services = definitionsAll.map((definition) => stateOf(definition, listeners, commandLineMap))
     // 可选 HTTP 健康探测：只在定义里显式配了 probe.path 时进行。
     await Promise.all(services.map(async (service, index) => {
@@ -226,9 +226,9 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
   /** 启动一条服务（幂等：已在监听则原样返回快照）。 */
   async function start(id, options = {}) {
     return enqueue(id, async () => {
-      const definition = findDefinition(id)
+      const definition = await findDefinition(id)
       if (definition.self === true) throw fail('OPERATION_FAILED', 'dsh 自身已在运行；请使用「重启 DSH」。')
-      const listeners = listListeners()
+      const listeners = await listListeners()
       const instance = instanceOf(id)
       if (definition.port !== null && listeners.has(definition.port)) {
         // 端口已在监听：不重启、不接管，如实返回当前状态。
@@ -296,7 +296,7 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
   /** 停止一条服务：先收自己的 handle，再按端口 + 签名接管外部占用者。 */
   async function stop(id, options = {}) {
     return enqueue(id, async () => {
-      const definition = findDefinition(id)
+      const definition = await findDefinition(id)
       if (definition.self === true) {
         throw fail('OPERATION_FAILED', '不能停止 dsh 自身（那会终止承载本页面的进程）；请使用「重启 DSH」。')
       }
@@ -316,16 +316,17 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
           instance.handleAlive = false
         }
         if (definition.port !== null) {
-          let pid = listListeners().get(definition.port)
+          let pid = (await listListeners()).get(definition.port)
           if (pid !== undefined) {
-            const signatureMatched = matchesSignature(commandLines([pid]).get(pid) ?? '', definition.match?.commandLinePattern)
+            const occupantCommandLine = (await commandLines([pid])).get(pid) ?? ''
+            const signatureMatched = matchesSignature(occupantCommandLine, definition.match?.commandLinePattern)
             const allowed = options.force === true || definition.takeover === 'force' || signatureMatched
             if (!allowed) {
               throw fail('PORT_OWNED_BY_OTHER',
                 `端口 ${definition.port} 被一个签名不匹配的进程占用（pid ${pid}），已拒绝终止。`,
-                { port: definition.port, pid, commandLine: commandLines([pid]).get(pid) ?? '', pattern: definition.match?.commandLinePattern ?? '' })
+                { port: definition.port, pid, commandLine: occupantCommandLine, pattern: definition.match?.commandLinePattern ?? '' })
             }
-            killTree(pid)
+            await killTree(pid)
             const free = await waitForPortFree(definition.port, { timeoutMs: STOP_WAIT_MS })
             if (!free) {
               instance.lastError = `已发出终止命令，但 ${STOP_WAIT_MS}ms 内端口 ${definition.port} 仍未释放（pid ${pid}）`
@@ -344,7 +345,7 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
 
   /** 重启一条服务：stop → start（dsh 自身走看守进程）。 */
   async function restart(id, options = {}) {
-    const definition = findDefinition(id)
+    const definition = await findDefinition(id)
     if (definition.self === true || definition.restartMode === 'supervisor') {
       return scheduleDshRestart(options)
     }
@@ -364,7 +365,7 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
         graceMs: scheduledRestart.graceMs,
       })
     }
-    const listeners = listListeners()
+    const listeners = await listListeners()
     const port = detectSelfPort(listeners)
     const requested = Number(options.graceSeconds ?? 60)
     const graceSeconds = Number.isFinite(requested) ? Math.min(Math.max(Math.trunc(requested), 15), 3600) : 60

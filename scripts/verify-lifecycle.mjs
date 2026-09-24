@@ -25,7 +25,7 @@ const record = (step, data) => console.log(`[${step}] ${JSON.stringify(data)}`)
 async function waitPort(port, present, timeoutMs) {
   const deadline = Date.now() + timeoutMs
   for (;;) {
-    if (listListeners().has(port) === present) return true
+    if ((await listListeners()).has(port) === present) return true
     if (Date.now() >= deadline) return false
     await sleep(250)
   }
@@ -48,7 +48,7 @@ fs.writeFileSync(configPath, `${JSON.stringify({
   }],
 }, null, 2)}\n`, 'utf8')
 
-assert.equal(listListeners().has(scratchPort), false, `验证端口 ${scratchPort} 必须先空闲`)
+assert.equal((await listListeners()).has(scratchPort), false, `验证端口 ${scratchPort} 必须先空闲`)
 
 const { ctx, disposers, invoke, pluginConfig } = createFakeSeam({ configPath, stateDir, logDir })
 apply(ctx, pluginConfig)
@@ -64,9 +64,9 @@ try {
   assert.equal(service.autostart, true)
 
   // 2) restart：PID 必须变化
-  const pidBefore = listListeners().get(scratchPort)
+  const pidBefore = (await listListeners()).get(scratchPort)
   const restarted = await invoke('restart', { id: 'scratch-auto' })
-  const pidAfter = listListeners().get(scratchPort)
+  const pidAfter = (await listListeners()).get(scratchPort)
   record('restart', { pidBefore, pidAfter, status: restarted.services.find((item) => item.id === 'scratch-auto')?.status })
   assert.ok(Number.isInteger(pidAfter), 'restart 之后端口必须仍被监听')
   assert.notEqual(pidAfter, pidBefore, 'restart 之后 PID 必须变化')
@@ -79,7 +79,7 @@ try {
 
   console.log('PASS')
 } finally {
-  const leftover = listListeners().get(scratchPort)
+  const leftover = (await listListeners()).get(scratchPort)
   if (leftover !== undefined) {
     spawn('taskkill', ['/PID', String(leftover), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
   }
