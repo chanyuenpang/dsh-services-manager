@@ -612,6 +612,22 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     return out
   }
 
+  /**
+   * 从启动命令里识别端口：`--port N` / `-p N` / `PORT=N` / `:N`。
+   * 表单允许不填端口（命令里通常已经写了），这里作为权威兜底；识别不到就保持 null（按进程状态判断）。
+   */
+  function portFromCommand(command) {
+    const text = String(command ?? '')
+    const patterns = [/--port[=\s]+(\d{2,5})/i, /-p[=\s]+(\d{2,5})/i, /PORT=(\d{2,5})/i, /:(\d{2,5})(?=\s|\/|$)/]
+    for (const pattern of patterns) {
+      const matched = pattern.exec(text)
+      if (matched === null) continue
+      const port = Number(matched[1])
+      if (Number.isInteger(port) && port >= 1 && port <= 65535) return port
+    }
+    return null
+  }
+
   /** 由名称派生一个合法 id（表单不要求用户自己想 id）。 */
   function slugify(value) {
     const base = String(value ?? '').toLowerCase().trim().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
@@ -640,11 +656,16 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     const requestedId = typeof input.id === 'string' && input.id.trim() !== '' ? slugify(input.id) : null
     const id = requestedId ?? uniqueId(slugify(input.title), new Set(existing.keys()))
     const before = existing.get(id) ?? null
+    // 端口可以不填：命令里写了就从命令里识别（`--port 5173` 之类），识别不到则保持 null。
+    const command = typeof input.command === 'string' && input.command.trim() !== '' ? input.command.trim() : (before?.command ?? '')
+    const port = Number.isInteger(input.port) ? input.port : (portFromCommand(command) ?? before?.port ?? null)
     const merged = {
       ...(before ?? {}),
       ...input,
       id,
       title: typeof input.title === 'string' && input.title.trim() !== '' ? input.title.trim() : (before?.title ?? id),
+      port,
+      command,
       url: typeof input.url === 'string' && input.url.trim() !== '' ? input.url.trim() : null,
       host: typeof input.host === 'string' && input.host.trim() !== '' ? input.host.trim() : '127.0.0.1',
       match: { commandLinePattern: typeof input.match?.commandLinePattern === 'string' ? input.match.commandLinePattern : (before?.match?.commandLinePattern ?? '') },

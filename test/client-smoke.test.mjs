@@ -352,6 +352,32 @@ test('表单：填完保存走 config.upsert（不需要用户写 JSON）', asyn
   assert.equal(upsert.payload.service.cwd, 'G:\\tmp')
 })
 
+test('端口可留空：只填启动命令也能自动识别出端口', async () => {
+  const bundle = loadBundle()
+  const { call, calls } = fakeCall({
+    'snapshot.fast': () => snapshotValue(),
+    'snapshot.full': () => snapshotValue(),
+    'config.get': () => ({ path: 'p', revision: 'rev-1', raw: JSON.stringify({ version: 1, services: [] }) }),
+    'config.upsert': () => ({ revision: 'rev-2', raw: '{}' }),
+  })
+  const mounted = await mountAndSettle(bundle, call)
+  findButton(mounted.raw, '添加服务').props.onClick()
+  bundle.beginRender()
+  const opened = render(registeredComponent(bundle.plugin), { call })
+  const inputs = findByClass(opened.raw, 'svc-input')
+  inputs[0].props.onChange({ target: { value: 'Demo' } })
+  inputs[2].props.onChange({ target: { value: 'npm run dev -- --port 5173' } })   // 端口故意不填
+  inputs[3].props.onChange({ target: { value: 'G:\\tmp' } })                      // 工作目录是必填项
+  bundle.beginRender()
+  const filled = render(registeredComponent(bundle.plugin), { call })
+  const portInput = findByClass(filled.raw, 'svc-input')[1]
+  assert.equal(portInput.props.value, '5173', '端口必须从启动命令里识别并预填')
+
+  await findButton(filled.raw, '保存').props.onClick()
+  const upsert = calls.find((entry) => entry.endpoint === 'config.upsert')
+  assert.equal(upsert.payload.service.port, 5173, '提交时也必须带上识别到的端口')
+})
+
 test('表单校验：缺名称/命令/目录时给出可读错误且不发请求', async () => {
   const bundle = loadBundle()
   const { call, calls } = fakeCall({

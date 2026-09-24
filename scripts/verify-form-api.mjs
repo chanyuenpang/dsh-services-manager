@@ -112,6 +112,24 @@ try {
   assert.equal(missing?.code, 'SERVICE_NOT_FOUND', '删除不存在的服务必须报 SERVICE_NOT_FOUND')
   record('config.remove.missing', { code: missing.code })
 
+  // 7) 端口可以留空：宿主必须从启动命令里识别，并据此推导 url
+  const beforeDerived = await invoke('config.get')
+  const derived = await invoke('config.upsert', {
+    expectedRevision: beforeDerived.revision,
+    service: {
+      title: 'Derived Port',
+      command: `node "${path.join(here, 'scratch-server.mjs')}" --port 4596`,
+      cwd: here,
+      match: { commandLinePattern: 'scratch-server\\.mjs' },
+    },
+  })
+  const derivedEntry = readServices().find((entry) => entry.id === derived.id)
+  assert.equal(derivedEntry.port, 4596, '端口必须从 --port 参数识别出来')
+  assert.equal(derivedEntry.url, 'http://127.0.0.1:4596/', '识别到端口后应自动推导 url')
+  await invoke('config.remove', { id: derived.id, expectedRevision: derived.revision })
+  assert.equal(readServices().length, 2, '收尾后配置应回到两条')
+  record('port.derived', { id: derived.id, port: derivedEntry.port, url: derivedEntry.url })
+
   console.log('PASS')
 } finally {
   const leftover = (await listListeners()).get(scratchPort)

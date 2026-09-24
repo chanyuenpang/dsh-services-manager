@@ -46,7 +46,8 @@ export const DEFAULT_CONFIG = {
       title: 'Mechanics Web',
       port: 4319,
       url: 'http://127.0.0.1:4319/',
-      command: 'node "C:\\Users\\chany\\AppData\\Roaming\\npm\\node_modules\\@veewo\\mechanics\\src\\server\\cli.mjs" web --port 4319',
+      // 启动命令走 shell 执行，所以 PATH 里的命令可以直接写（mech 是全局 bin，不必写全路径）。
+      command: 'mech web',
       cwd: 'G:\\Projects\\mechanics',
       autostart: false,
       autoStopOnExit: true,
