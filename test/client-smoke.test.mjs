@@ -292,6 +292,24 @@ test('编辑：挂载时没取到配置，点「编辑」也会当场取回定�
   assert.ok(calls.some((entry) => entry.endpoint === 'config.get'), '必须真的请求过 config.get')
 })
 
+test('内置条目（dsh 自身，managed:false）不显示编辑/启停，只给「重启 DSH」', async () => {
+  const bundle = loadBundle()
+  const { call } = fakeCall({
+    'snapshot.fast': () => snapshotValue({
+      services: [{
+        ...service({ id: 'dsh', title: 'DSH Web（本实例）', port: 3099, pid: 1234, status: 'running', ownership: 'none', managed: false }),
+      }],
+      summary: { total: 1, running: 1, stopped: 0, error: 0, unknown: 0 },
+    }),
+  })
+  const { raw, text } = await mountAndSettle(bundle, call)
+  assert.ok(text.includes('DSH Web（本实例）'), '内置条目必须渲染')
+  assert.equal(findButton(raw, '编辑配置'), null, '内置条目不得有「编辑配置」')
+  assert.equal(findButton(raw, '启动'), null, '内置条目不得有「启动」')
+  assert.equal(findButton(raw, '停止'), null, '内置条目不得有「停止」')
+  assert.ok(findButton(raw, '重启 DSH') !== null, '内置条目必须能一键重启 DSH')
+})
+
 test('表单：填完保存走 config.upsert（不需要用户写 JSON）', async () => {
   const bundle = loadBundle()
   const { call, calls } = fakeCall({
