@@ -110,14 +110,18 @@ function textOf(node) {
   return (node.children || []).map(textOf).join('')
 }
 
-/** 在渲染树里按按钮文案找按钮（用于驱动交互）。 */
+/** 在渲染树里按按钮文案 / hover 标题 / 无障碍名找按钮（按钮只留图标，文字在 title 与 aria-label 里）。 */
 function findButton(node, label) {
   if (node === null || node === undefined || typeof node !== 'object') return null
   if (Array.isArray(node)) {
     for (const child of node) { const found = findButton(child, label); if (found !== null) return found }
     return null
   }
-  if (node.type === 'button' && textOf(node).includes(label)) return node
+  if (node.type === 'button') {
+    const props = node.props || {}
+    const names = [textOf(node), props.title, props['aria-label']].filter((value) => typeof value === 'string')
+    if (names.some((value) => value.includes(label))) return node
+  }
   for (const child of node.children || []) { const found = findButton(child, label); if (found !== null) return found }
   return null
 }
@@ -253,6 +257,39 @@ test('挂载先走 snapshot.fast；点「全部刷新」走 snapshot.full', asyn
   await refreshButton.props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.ok(calls.some((entry) => entry.endpoint === 'snapshot.full'), '显式刷新必须走 full')
+})
+
+test('编辑：挂载时没取到配置，点「编辑」也会当场取回定义并填好表单', async () => {
+  const bundle = loadBundle()
+  const entryRaw = JSON.stringify({
+    version: 1,
+    services: [{
+      id: 'mechanics-web', title: 'Mechanics Web', port: 4319,
+      command: 'node cli.mjs web', cwd: 'G:\\Projects\\mechanics',
+      autostart: true, autoStopOnExit: false, match: { commandLinePattern: 'cli\\.mjs' },
+    }],
+  })
+  let configCalls = 0
+  const { call, calls } = fakeCall({
+    'snapshot.fast': () => snapshotValue(),
+    'snapshot.full': () => snapshotValue(),
+    // 第一次（挂载期）故意返回空值，模拟「先前那次取配置没成功」
+    'config.get': () => { configCalls += 1; return configCalls === 1 ? null : { path: 'C:/.dsh/.dsh-services-manager/services.json', revision: 'rev-1', raw: entryRaw } },
+  })
+  const mounted = await mountAndSettle(bundle, call)
+  const editButton = findButton(mounted.raw, '编辑')
+  assert.ok(editButton !== null, '每行必须有「编辑」按钮')
+  editButton.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))   // startEdit 是异步的（必要时当场取配置）
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  bundle.beginRender()
+  const opened = render(registeredComponent(bundle.plugin), { call })
+  assert.ok(opened.classes.some((value) => value.includes('svc-form')), '点「编辑」必须打开表单（当场取配置）')
+  const inputs = findByClass(opened.raw, 'svc-input')
+  assert.equal(inputs[0].props.value, 'Mechanics Web', '名称必须按定义预填')
+  assert.equal(inputs[2].props.value, 'node cli.mjs web', '启动命令必须按定义预填')
+  assert.ok(configCalls >= 2, '应当在点开表单时重新取过一次配置')
+  assert.ok(calls.some((entry) => entry.endpoint === 'config.get'), '必须真的请求过 config.get')
 })
 
 test('表单：填完保存走 config.upsert（不需要用户写 JSON）', async () => {
