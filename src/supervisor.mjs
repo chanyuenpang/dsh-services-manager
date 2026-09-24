@@ -591,6 +591,98 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     }
   }
 
+  /** 把规范化定义还原成配置文件里的字段形状（saveConfig 会再规范化一次并原子落盘）。 */
+  function toFileShape(definition) {
+    const out = {
+      id: definition.id,
+      title: definition.title,
+      port: definition.port,
+      command: definition.command,
+      cwd: definition.cwd,
+      autostart: definition.autostart === true,
+      autoStopOnExit: definition.autoStopOnExit !== false,
+      takeover: definition.takeover === 'force' ? 'force' : 'match',
+      match: { commandLinePattern: definition.match?.commandLinePattern ?? '' },
+    }
+    if (typeof definition.url === 'string' && definition.url !== '') out.url = definition.url
+    if (typeof definition.host === 'string' && definition.host !== '' && definition.host !== '127.0.0.1') out.host = definition.host
+    if (definition.env !== null && typeof definition.env === 'object' && Object.keys(definition.env).length > 0) out.env = definition.env
+    if (definition.restartMode === 'supervisor') out.restartMode = 'supervisor'
+    if (typeof definition.probe?.path === 'string' && definition.probe.path !== '') out.probe = definition.probe
+    return out
+  }
+
+  /** 由名称派生一个合法 id（表单不要求用户自己想 id）。 */
+  function slugify(value) {
+    const base = String(value ?? '').toLowerCase().trim().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
+    return base === '' ? 'service' : base.slice(0, 40)
+  }
+
+  function uniqueId(base, taken) {
+    if (!taken.has(base)) return base
+    for (let index = 2; index < 200; index += 1) {
+      const candidate = `${base}-${index}`
+      if (!taken.has(candidate)) return candidate
+    }
+    return `${base}-${Date.now()}`
+  }
+
+  /**
+   * 表单写入路径：按 id 新增或更新一条服务定义，其余条目原样保留。
+   * 仍然走 saveConfig（校验 + 原子写 + expectedRevision），所以并发保护与「配置即唯一真相」都不变。
+   * @param {{service?: object, expectedRevision?: string}} payload
+   */
+  async function configUpsert(payload = {}) {
+    const input = payload.service
+    if (input === null || typeof input !== 'object') throw fail('CONFIG_INVALID', 'config.upsert 需要 service 对象')
+    const current = readConfig(configPath)
+    const existing = new Map(current.services.map((definition) => [definition.id, definition]))
+    const requestedId = typeof input.id === 'string' && input.id.trim() !== '' ? slugify(input.id) : null
+    const id = requestedId ?? uniqueId(slugify(input.title), new Set(existing.keys()))
+    const before = existing.get(id) ?? null
+    const merged = {
+      ...(before ?? {}),
+      ...input,
+      id,
+      title: typeof input.title === 'string' && input.title.trim() !== '' ? input.title.trim() : (before?.title ?? id),
+      url: typeof input.url === 'string' && input.url.trim() !== '' ? input.url.trim() : null,
+      host: typeof input.host === 'string' && input.host.trim() !== '' ? input.host.trim() : '127.0.0.1',
+      match: { commandLinePattern: typeof input.match?.commandLinePattern === 'string' ? input.match.commandLinePattern : (before?.match?.commandLinePattern ?? '') },
+      probe: {
+        path: typeof input.probe?.path === 'string' && input.probe.path !== '' ? input.probe.path : null,
+        expectStatus: Number.isInteger(input.probe?.expectStatus) ? input.probe.expectStatus : null,
+        intervalMs: null,
+      },
+    }
+    // 端口为空时按 URL/默认推导，避免留下「有端口却没写」的半成品。
+    const text = `${JSON.stringify({
+      version: 1,
+      services: [...current.services.filter((definition) => definition.id !== id), merged].map(toFileShape),
+    }, null, 2)}\n`
+    const saved = saveConfig(configPath, text, payload.expectedRevision)
+    touch()
+    return { path: saved.path, revision: saved.revision, raw: saved.raw, id }
+  }
+
+  /**
+   * 表单删除路径：删掉一条服务定义（不动任何正在运行的进程）。
+   * @param {{id?: string, expectedRevision?: string}} payload
+   */
+  async function configRemove(payload = {}) {
+    const id = requireId(payload)
+    const current = readConfig(configPath)
+    if (!current.services.some((definition) => definition.id === id)) {
+      throw fail('SERVICE_NOT_FOUND', `配置里没有 id 为 ${id} 的服务`, { id })
+    }
+    const text = `${JSON.stringify({
+      version: 1,
+      services: current.services.filter((definition) => definition.id !== id).map(toFileShape),
+    }, null, 2)}\n`
+    const saved = saveConfig(configPath, text, payload.expectedRevision)
+    touch()
+    return { path: saved.path, revision: saved.revision, raw: saved.raw, id }
+  }
+
   /** RPC 端点分发（唯一通道 /dsh-services）。 */
   async function handle(endpoint, payload) {
     switch (endpoint) {
@@ -603,6 +695,8 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
       case 'restart-dsh': return scheduleDshRestart(payload)
       case 'config.get': return configGet()
       case 'config.set': return configSet(payload)
+      case 'config.upsert': return configUpsert(payload)
+      case 'config.remove': return configRemove(payload)
       case 'logs': return logs(requireId(payload), payload)
       default: throw fail('UNKNOWN_ENDPOINT', `未知端点 ${endpoint}`)
     }

@@ -76,11 +76,12 @@ function loadBundle() {
   }
 }
 
-/** 渲染一次组件，收集 className、data-* 与文本。 */
+/** 渲染一次组件，收集 className、data-*、title 与文本。 */
 function render(component, props) {
   const raw = component(props)
   const classes = []
   const dataAttrs = []
+  const titles = []
   const texts = []
   const walk = (node) => {
     if (node === null || node === undefined || typeof node !== 'object') {
@@ -90,13 +91,44 @@ function render(component, props) {
     if (Array.isArray(node)) { node.forEach(walk); return }
     const propsOf = node.props || {}
     if (typeof propsOf.className === 'string') classes.push(propsOf.className)
+    if (typeof propsOf.title === 'string') titles.push(propsOf.title)
     for (const [key, value] of Object.entries(propsOf)) {
       if (key.startsWith('data-')) dataAttrs.push(`${key}=${String(value)}`)
     }
     ;(node.children || []).forEach(walk)
   }
   walk(raw)
-  return { raw, classes, dataAttrs, text: texts.join(' | ') }
+  return { raw, classes, dataAttrs, titles, text: texts.join(' | ') }
+}
+
+/** 元素的纯文本（含嵌套子节点），用于按文案找按钮。 */
+function textOf(node) {
+  if (node === null || node === undefined) return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (typeof node !== 'object') return ''
+  if (Array.isArray(node)) return node.map(textOf).join('')
+  return (node.children || []).map(textOf).join('')
+}
+
+/** 在渲染树里按按钮文案找按钮（用于驱动交互）。 */
+function findButton(node, label) {
+  if (node === null || node === undefined || typeof node !== 'object') return null
+  if (Array.isArray(node)) {
+    for (const child of node) { const found = findButton(child, label); if (found !== null) return found }
+    return null
+  }
+  if (node.type === 'button' && textOf(node).includes(label)) return node
+  for (const child of node.children || []) { const found = findButton(child, label); if (found !== null) return found }
+  return null
+}
+
+/** 按 className 收集元素（表单输入用）。 */
+function findByClass(node, className, found = []) {
+  if (node === null || node === undefined || typeof node !== 'object') return found
+  if (Array.isArray(node)) { node.forEach((child) => findByClass(child, className, found)); return found }
+  if (node.props && node.props.className === className) found.push(node)
+  ;(node.children || []).forEach((child) => findByClass(child, className, found))
+  return found
 }
 
 /** 挂载 → 跑 effect（触发 fast/full 拉取）→ 等 promise 落地 → 用更新后的 state 重新渲染。 */
@@ -179,13 +211,13 @@ test('tier 1 且无 pid 时显示「读取中…」而不是「未知」', async
 test('正常快照渲染卡片、汇总与新鲜度文案', async () => {
   const bundle = loadBundle()
   const { call } = fakeCall({ 'snapshot.fast': () => snapshotValue() })
-  const { classes, dataAttrs, text } = await mountAndSettle(bundle, call)
+  const { classes, dataAttrs, titles, text } = await mountAndSettle(bundle, call)
   assert.ok(classes.some((value) => value.includes('svc-card')), '必须渲染服务卡片')
   assert.ok(dataAttrs.includes('data-status=running'), '状态必须由 data-status 驱动')
   assert.ok(dataAttrs.includes('data-ownership=discovered'), '来源必须由 data-ownership 驱动')
   assert.ok(text.includes('快照缓存命中'), '新鲜度文案必须来自 timing')
   assert.ok(text.includes('Mechanics Web') && text.includes('33876'), '名称与 PID 必须在')
-  assert.ok(text.includes('外部进程'), '来源文案必须在')
+  assert.ok(titles.some((value) => value.includes('外部进程')), '来源的语义放在 tooltip 里')
   assert.ok(text.includes('共 1'), '汇总必须在')
 })
 
@@ -216,19 +248,71 @@ test('挂载先走 snapshot.fast；点「全部刷新」走 snapshot.full', asyn
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.ok(calls.some((entry) => entry.endpoint === 'snapshot.fast'), '首屏必须用 fast')
 
-  const findButton = (node, label) => {
-    if (node === null || node === undefined || typeof node !== 'object') return null
-    if (Array.isArray(node)) {
-      for (const child of node) { const found = findButton(child, label); if (found !== null) return found }
-      return null
-    }
-    if (node.type === 'button' && (node.children || []).includes(label)) return node
-    for (const child of node.children || []) { const found = findButton(child, label); if (found !== null) return found }
-    return null
-  }
   const refreshButton = findButton(raw, '全部刷新')
   assert.ok(refreshButton !== null, '必须有「全部刷新」按钮')
   await refreshButton.props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.ok(calls.some((entry) => entry.endpoint === 'snapshot.full'), '显式刷新必须走 full')
+})
+
+test('表单：填完保存走 config.upsert（不需要用户写 JSON）', async () => {
+  const bundle = loadBundle()
+  const { call, calls } = fakeCall({
+    'snapshot.fast': () => snapshotValue(),
+    'snapshot.full': () => snapshotValue(),
+    'config.get': () => ({
+      path: 'C:/.dsh/.dsh-services-manager/services.json', revision: 'rev-1',
+      raw: JSON.stringify({ version: 1, services: [] }),
+    }),
+    'config.upsert': (payload) => ({ path: 'p', revision: 'rev-2', raw: '{"version":1,"services":[]}', id: 'demo' }),
+  })
+  const mounted = await mountAndSettle(bundle, call)
+  assert.ok(calls.some((entry) => entry.endpoint === 'config.get'), '挂载时必须取一次配置拿 expectedRevision')
+
+  const addButton = findButton(mounted.raw, '添加服务')
+  assert.ok(addButton !== null, '必须有「添加服务」按钮')
+  addButton.props.onClick()
+  bundle.beginRender()
+  const opened = render(registeredComponent(bundle.plugin), { call })
+  assert.ok(opened.classes.some((value) => value.includes('svc-form')), '点「添加服务」必须出现表单')
+
+  const inputs = findByClass(opened.raw, 'svc-input')
+  assert.ok(inputs.length >= 4, '表单至少有名称/端口/启动命令/工作目录四个输入')
+  inputs[0].props.onChange({ target: { value: 'Demo 服务' } })
+  inputs[1].props.onChange({ target: { value: '4599' } })
+  inputs[2].props.onChange({ target: { value: 'node demo.mjs' } })
+  inputs[3].props.onChange({ target: { value: 'G:\\tmp' } })
+  bundle.beginRender()
+  const filled = render(registeredComponent(bundle.plugin), { call })
+  const saveButton = findButton(filled.raw, '保存')
+  assert.ok(saveButton !== null, '表单必须有保存按钮')
+  await saveButton.props.onClick()
+
+  const upsert = calls.find((entry) => entry.endpoint === 'config.upsert')
+  assert.ok(upsert !== undefined, '保存必须走 config.upsert 而不是整份 JSON')
+  assert.equal(upsert.payload.expectedRevision, 'rev-1', '必须带 expectedRevision 做并发保护')
+  assert.equal(upsert.payload.service.title, 'Demo 服务')
+  assert.equal(upsert.payload.service.port, 4599)
+  assert.equal(upsert.payload.service.command, 'node demo.mjs')
+  assert.equal(upsert.payload.service.cwd, 'G:\\tmp')
+})
+
+test('表单校验：缺名称/命令/目录时给出可读错误且不发请求', async () => {
+  const bundle = loadBundle()
+  const { call, calls } = fakeCall({
+    'snapshot.fast': () => snapshotValue(),
+    'snapshot.full': () => snapshotValue(),
+    'config.get': () => ({ path: 'p', revision: 'rev-1', raw: JSON.stringify({ version: 1, services: [] }) }),
+    'config.upsert': () => ({ revision: 'rev-2', raw: '{}' }),
+  })
+  const mounted = await mountAndSettle(bundle, call)
+  findButton(mounted.raw, '添加服务').props.onClick()
+  bundle.beginRender()
+  const opened = render(registeredComponent(bundle.plugin), { call })
+  const saveButton = findButton(opened.raw, '保存')
+  await saveButton.props.onClick()
+  bundle.beginRender()
+  const failed = render(registeredComponent(bundle.plugin), { call })
+  assert.ok(failed.text.includes('必填'), '必须给出行内校验错误')
+  assert.ok(!calls.some((entry) => entry.endpoint === 'config.upsert'), '校验失败不得发出写请求')
 })

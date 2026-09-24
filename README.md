@@ -77,11 +77,18 @@ dsh plugin --profile web add G:/Projects/dsh-plugins/dsh-services-manager
 
 ## 面板
 
+**日常操作全部走表单，不需要写 JSON。**
+
 | 位置 | 内容 |
 | --- | --- |
-| 顶部 | 总数 / 运行 / 异常汇总，「全部刷新」，「重启 DSH」 |
-| 每行 | 状态点、名称、端口、所有权标记（`spawned` 本插件启动 / `discovered` 外部进程）、PID、可点击的 URL、最近退出码或错误；行内 启动 / 停止 / 重启 / 日志 |
-| 底部 | 「配置 (JSON)」折叠区：直接编辑配置文件，保存时带 revision 校验 |
+| 顶部 | 「＋ 添加服务」「全部刷新」「重启 DSH」 |
+| 汇总行 | 共 / 运行 / 已停止 / 异常，以及数据新鲜度（快照缓存命中 · 数据年龄 Nms · 后台补齐中） |
+| 每行服务 | 状态徽标（颜色 + 形状 + 文案三重信号）、名称（有 URL 时即链接）、`:端口`、`pid N`、来源符号（`◆` 本插件启动 / `◇` 外部进程，悬停看解释）、操作按钮（启动 / 停止 / 重启 / 日志 / 编辑）。**“最近事件”只在真有问题时（错误或非零退出）才占一行** |
+| 添加 / 编辑表单 | 名称、端口、启动命令、工作目录 + 两个开关（dsh 启动时自动拉起 / dsh 退出时停止）；「高级选项」里才是 id、接管签名、健康检查路径；编辑态多一个「删除」 |
+| 底部（高级） | 「高级：直接编辑 JSON」——用于批量修改或表单未覆盖的字段（`env`、`probe.expectStatus` 等）。保存同样受 `expectedRevision` 保护 |
+
+表单只写**定义类**字段，写入路径是宿主的 `config.upsert` / `config.remove`（校验 + 原子写 + 并发保护），
+绝不触碰运行态；删除一条配置**不会**停止任何正在运行的进程。
 
 - 轮询：分区打开时每 4 秒刷新一次，页面不可见时暂停，关闭设置即停止。
 - 状态是宿主的快照投影，`revision` 单调递增，过期响应会被丢弃（避免刷新竞态把新状态覆盖回旧状态）。
@@ -106,6 +113,7 @@ npm test                            # 15 个单测：netstat 解析、签名正�
 node scripts/verify-host.mjs 4599   # 真机验证：不重启 dsh，用最小 seam 替身驱动真实 RPC 面
 node scripts/verify-lifecycle.mjs 4598  # autostart 拉起 → restart 换 PID → dispose 释放端口
 node scripts/verify-rpc-http.mjs "<token url>"  # 真实 HTTP 层：信封字段 + 快层首屏耗时
+node scripts/verify-form-api.mjs 4597      # 表单写入路径：upsert/remove 真的改到文件、并发冲突被拒、建出来的服务真能启停
 node scripts/bench-snapshot.mjs 5   # 快照耗时基线 + 「事件循环是否被阻塞」的客观测法
 pwsh -File scripts/preview-sandbox.ps1        # 起隔离沙箱并在终端打印预览地址（只碰 3099 / .sandbox）
 pwsh -File scripts/preview-sandbox.ps1 -Stop  # 看完停掉
@@ -156,7 +164,8 @@ pwsh -File scripts/preview-sandbox.ps1 -Stop  # 看完停掉
 - 浏览器半边 `lib/client.js` 是手写的 `window.__ModuleLoader__.load({...})` 单文件 bundle，注册 `settings.section`，只通过 `ctx.connection.rpc.call` 与宿主通信。
 - 监管核心 `src/supervisor.mjs`：活性以端口为准，所有权分 `spawned` / `discovered`，终止外部进程前必须通过命令行签名校验。
 
-RPC 端点：`snapshot`（入参见上节 `mode`）、`start`、`stop`、`restart`、`restart-dsh`、`config.get`、`config.set`、`logs`；
+RPC 端点：`snapshot`（入参见上节 `mode`）、`snapshot.fast`、`snapshot.full`、`start`、`stop`、`restart`、`restart-dsh`、
+`config.get`、`config.set`（整份 JSON）、`config.upsert`（表单：按 id 新增/更新一条）、`config.remove`、`logs`；
 信封是 `{ ok: true, value }` / `{ ok: false, error: { code, message, details } }`
 （字段名是 **`value`**，且 `details` 是必填对象 —— 传输层按 schema 会剥掉未知键，写错字段名会让浏览器只收到 `{ ok: true }`）；
 错误码：`SERVICE_NOT_FOUND`、`PORT_OWNED_BY_OTHER`、`CONFIG_CONFLICT`、`CONFIG_INVALID`、`ALREADY_SCHEDULED`、`UNKNOWN_ENDPOINT`、`TIMEOUT`、`OPERATION_FAILED`。
