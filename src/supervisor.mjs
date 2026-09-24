@@ -55,15 +55,22 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
    */
   let detail = null
   let detailInFlight = null
+  /** 已组装快照的缓存（进程内，不持久化）：快层命中它就 0ms 返回。 */
+  let snapshotCache = null
+  /** 不变量 8：dispose 之后不得再回写缓存、推进 revision 或继续在途补齐。 */
+  let disposed = false
   /** 快层 TCP 探测的超时：够本机 loopback 用，且决定首屏最坏耗时。 */
   const FAST_PROBE_TIMEOUT_MS = 250
-  /** 详层超过这个年龄就在响应里标过期，让客户端知道「当前看到的是旧详情」。 */
+  /** 快照缓存的有效期（设计建议值）：期间内的 fast 请求直接命中，不再做 TCP 探测。 */
+  const TIER1_TTL_MS = 1500
+  /** 详层多久算「该重新采了」：到点后台刷新，不影响本次返回。 */
+  const DETAIL_TTL_MS = 30_000
+  /** 详层超过这个年龄就在响应里标 degraded，让客户端知道「当前看到的是旧详情」。 */
   const DETAIL_STALE_MS = 5000
-  /** 快照模式：'full' 等详层（兼容旧调用），'fast' 立即用现有详层返回。 */
+  /** 快照模式：'full' 等详层刷新（旧调用/显式刷新），'fast' 立即用缓存或快层返回。 */
   const SNAPSHOT_MODES = new Set(['fast', 'full'])
 
   const now = () => new Date().toISOString()
-  const elapsed = (from) => (from === null || from === undefined ? null : Date.now() - from)
 
   function touch() {
     revision += 1
@@ -133,6 +140,7 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
         }
         const commandLineMap = await commandLines([...new Set([...byPort.values()].map((entry) => entry.pid))])
         for (const entry of byPort.values()) entry.commandLine = commandLineMap.get(entry.pid) ?? ''
+        if (disposed === true) return detail
         detail = { at: Date.now(), selfPort: confirmed, byPort }
         touch()
       } catch {
@@ -249,21 +257,53 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
    * @param {{mode?: 'fast'|'full'}} [options] - `full` 等详层刷新完成（旧调用/显式刷新用），
    *   `fast`（缺省）立即用现有详层返回并在后台刷新。
    */
+  /**
+   * 给快照挂上新鲜度元数据（唯一 owner 是宿主；客户端只投影，不自己造）。
+   * @param payload - 已组装好的快照主体
+   * @param collectedAt - 这份 services 是何时采到的
+   * @param extra - `{ returnedFromCache, cacheMiss }`
+   */
+  function withTiming(payload, collectedAt, extra) {
+    const at = Date.now()
+    return {
+      ...payload,
+      timing: {
+        collectedAt,
+        servedAt: extra.servedAt ?? at,
+        ageMs: at - collectedAt,
+        tier: detail === null ? 1 : 2,
+        returnedFromCache: extra.returnedFromCache === true,
+        refreshing: detailInFlight !== null,
+        degraded: detail === null || at - detail.at > DETAIL_STALE_MS,
+        revision,
+        cacheMiss: extra.cacheMiss === true,
+      },
+    }
+  }
+
   async function snapshot(options = {}) {
     const mode = SNAPSHOT_MODES.has(options.mode) ? options.mode : 'full'
+    const startedAt = Date.now()
+    // 快层命中：上一份观测还在 tier1 TTL 内 → 0ms 直接返回它，慢层继续在后台补齐。
+    if (mode === 'fast' && snapshotCache !== null && startedAt - snapshotCache.collectedAt <= TIER1_TTL_MS) {
+      if (detail === null || startedAt - detail.at > DETAIL_TTL_MS) void refreshDetail()
+      return withTiming(snapshotCache.payload, snapshotCache.collectedAt, {
+        returnedFromCache: true, cacheMiss: false, servedAt: startedAt,
+      })
+    }
+    const cacheMiss = snapshotCache === null
     const { config, list } = definitions()
     if (mode === 'full') {
       await refreshDetail()
-    } else if (detail === null || Date.now() - detail.at > DETAIL_STALE_MS) {
+    } else if (detail === null || startedAt - detail.at > DETAIL_TTL_MS) {
       void refreshDetail()
     }
-    const refreshing = detailInFlight !== null
     const definitionsAll = [selfDefinition(currentSelfPort()), ...list]
     const probes = await Promise.all(definitionsAll.map((definition) => (
       definition.port === null ? Promise.resolve(false) : tcpProbe(definition.host, definition.port, FAST_PROBE_TIMEOUT_MS)
     )))
     const services = definitionsAll.map((definition, index) => stateOf(definition, { running: probes[index] }, detail))
-    // 可选 HTTP 健康探测：只在定义里显式配了 probe.path 时进行。
+    // 可选 HTTP 健康探测：只在定义里显式配了 probe.path 时进行（属 tier2）。
     await Promise.all(services.map(async (service, index) => {
       const probe = definitionsAll[index].probe
       if (probe?.path == null || service.port === null || service.status !== 'running') return
@@ -278,8 +318,7 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
       else if (service.status === 'stopped') summary.stopped += 1
       else summary.unknown += 1
     }
-    const ageMs = elapsed(detail?.at)
-    return {
+    const payload = {
       revision,
       configPath,
       configRevision: config.revision,
@@ -288,11 +327,11 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
       summary,
       services,
       mode,
-      detailAt: detail?.at ?? null,
-      ageMs,
-      stale: mode === 'fast' && (ageMs === null || ageMs > DETAIL_STALE_MS),
-      refreshing,
     }
+    if (disposed === false) snapshotCache = { collectedAt: Date.now(), revision, payload }
+    return withTiming(payload, snapshotCache?.collectedAt ?? startedAt, {
+      returnedFromCache: false, cacheMiss, servedAt: startedAt,
+    })
   }
 
   function stateDirReady() {
@@ -395,7 +434,8 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
         if (definition.port !== null) {
           let pid = (await listListeners()).get(definition.port)
           if (pid !== undefined) {
-            const occupantCommandLine = (await commandLines([pid])).get(pid) ?? ''
+            // 不变量 7：终止判据必须用当次实时命令行，不得用可能过期的缓存。
+            const occupantCommandLine = (await commandLines([pid], { fresh: true })).get(pid) ?? ''
             const signatureMatched = matchesSignature(occupantCommandLine, definition.match?.commandLinePattern)
             const allowed = options.force === true || definition.takeover === 'force' || signatureMatched
             if (!allowed) {
@@ -532,6 +572,8 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
 
   /** 插件卸载（dsh 退出/重启）时停止本插件启动的实例。 */
   async function dispose() {
+    // 不变量 8：先立旗，在途的探测/补齐回来时不得再回写缓存或推进 revision。
+    disposed = true
     const { list } = (() => {
       try {
         return definitions()
@@ -553,6 +595,8 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
   async function handle(endpoint, payload) {
     switch (endpoint) {
       case 'snapshot': return snapshot(payload ?? {})
+      case 'snapshot.fast': return snapshot({ mode: 'fast' })
+      case 'snapshot.full': return snapshot({ mode: 'full' })
       case 'start': return start(requireId(payload), payload)
       case 'stop': return stop(requireId(payload), payload)
       case 'restart': return restart(requireId(payload), payload)

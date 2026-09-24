@@ -64,7 +64,32 @@ record('snapshot', {
   })),
 })
 
-// 3) config.get：唯一真相文件的原文与 revision
+// 3) 快层：首屏路径必须是毫秒级，且带新鲜度语义（timing 由宿主计算，客户端只投影）
+const fastStarted = Date.now()
+const fast = await rpc('snapshot.fast')
+const fastMs = Date.now() - fastStarted
+assert.equal(fast.ok, true, `snapshot.fast 失败：${JSON.stringify(fast.error ?? {})}`)
+const timing = fast.value.timing
+assert.ok(timing !== null && typeof timing === 'object', 'snapshot.fast 必须带 timing')
+assert.equal(typeof timing.collectedAt, 'number', 'timing.collectedAt 必须是数字')
+assert.equal(typeof timing.ageMs, 'number', 'timing.ageMs 必须是数字')
+assert.ok(timing.tier === 1 || timing.tier === 2, 'timing.tier 必须是 1 或 2')
+assert.equal(typeof timing.returnedFromCache, 'boolean', 'timing.returnedFromCache 必须是布尔')
+assert.equal(typeof timing.refreshing, 'boolean', 'timing.refreshing 必须是布尔')
+assert.equal(typeof timing.degraded, 'boolean', 'timing.degraded 必须是布尔')
+assert.equal(typeof timing.cacheMiss, 'boolean', 'timing.cacheMiss 必须是布尔')
+assert.ok(Array.isArray(fast.value.services), 'snapshot.fast.services 必须是数组')
+record('snapshot.fast', {
+  elapsedMs: fastMs,
+  returnedFromCache: timing.returnedFromCache,
+  tier: timing.tier,
+  degraded: timing.degraded,
+  refreshing: timing.refreshing,
+  ageMs: timing.ageMs,
+  pids: fast.value.services.map((service) => `${service.id}:${service.pid ?? '-'}`),
+})
+
+// 4) config.get：唯一真相文件的原文与 revision
 const config = await rpc('config.get', {})
 assert.equal(config.ok, true)
 assert.equal(typeof config.value.raw, 'string', 'config.get.value.raw 必须是字符串')

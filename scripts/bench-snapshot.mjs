@@ -37,44 +37,59 @@ console.log(`分项基线：netstat ${listenerMs}ms（${listeners.size} 个监�
 const { ctx, invoke, pluginConfig } = createFakeSeam({ configPath, stateDir, logDir })
 apply(ctx, pluginConfig)
 
-/** 统计一次 snapshot 期间 10ms 定时器实际触发的次数（阻塞越久，次数越少）。 */
-async function measure(label) {
-  let ticks = 0
-  const timer = setInterval(() => { ticks += 1 }, 10)
+/**
+ * 统计一次 snapshot 期间**心跳最坏间隔**（10ms 定时器相邻两次触发的最大间隔）。
+ * 为什么不用 `monitorEventLoopDelay`：对同步阻塞不敏感（实测 1813ms 阻塞时它只报 16ms）；
+ * 也不用「tick 总数」：异步化后单次阻塞仍有 70–216ms，只看总数会得出「没有阻塞」的错误结论。
+ */
+async function measure(label, endpoint = 'snapshot.full') {
+  const gaps = []
+  let last = Date.now()
+  const timer = setInterval(() => {
+    const at = Date.now()
+    gaps.push(at - last)
+    last = at
+  }, 10)
   const started = Date.now()
-  const snapshot = await invoke('snapshot')
+  const snapshot = await invoke(endpoint, endpoint === 'snapshot.fast' ? { mode: 'fast' } : {})
   const elapsed = Date.now() - started
   clearInterval(timer)
-  const expected = Math.floor(elapsed / 10)
+  const worst = gaps.length === 0 ? elapsed : Math.max(...gaps)
+  const timing = snapshot.timing ?? {}
   console.log(
-    `${label}: ${elapsed}ms | 事件循环 tick ${ticks}/${expected}` +
+    `${label}: ${elapsed}ms | 心跳最坏间隔 ${worst}ms | tick ${gaps.length}` +
+    ` | tier=${String(timing.tier)} cache=${String(timing.returnedFromCache)} ageMs=${String(timing.ageMs)}` +
     ` | 服务 ${snapshot.services.length}（${snapshot.services.map((s) => `${s.id}=${s.status}`).join(', ')}）`,
   )
-  return { elapsed, ticks, expected }
+  return { elapsed, worst }
 }
 
 const cold = await measure('第 1 次（冷）')
 const warm = []
 for (let index = 2; index <= rounds; index += 1) warm.push(await measure(`第 ${index} 次`))
 
+const worstGaps = [cold, ...warm].map((item) => item.worst)
+const blocked = worstGaps.filter((gap) => gap > 50).length
 const times = [cold, ...warm].map((item) => item.elapsed).sort((a, b) => a - b)
 const median = times[Math.floor(times.length / 2)]
-const blocked = [cold, ...warm].filter((item) => item.expected >= 5 && item.ticks <= 1).length
 console.log(`\n中位耗时：${median}ms | 最小 ${times[0]}ms | 最大 ${times[times.length - 1]}ms`)
-console.log(`事件循环被阻塞的轮数：${blocked}/${times.length}（判据：期望 tick ≥5 时实际 ≤1）`)
+console.log(`心跳最坏间隔：${Math.max(...worstGaps)}ms（判据：>50ms 记为一次可感阻塞）`)
+console.log(`可感阻塞轮数：${blocked}/${worstGaps.length}`)
 
-// 快层：首屏路径 —— 只做本机 TCP 探测 + 读现有详层，不等 netstat/PowerShell。
-console.log('\n--- 快层 mode=fast（首屏路径）---')
+// 快层：首屏路径 —— 命中快照缓存则 0ms 返回，未命中只做本机 TCP 探测，绝不等 netstat/PowerShell。
+console.log('\n--- 快层 snapshot.fast（首屏路径）---')
 const fastTimes = []
 for (let index = 1; index <= rounds; index += 1) {
   const started = Date.now()
-  const fastSnapshot = await invoke('snapshot', { mode: 'fast' })
+  const fastSnapshot = await invoke('snapshot.fast')
   const elapsedMs = Date.now() - started
   fastTimes.push(elapsedMs)
+  const timing = fastSnapshot.timing ?? {}
   const missingPid = fastSnapshot.services.filter((service) => service.pid === null).length
   console.log(
-    `fast #${index}: ${elapsedMs}ms | stale=${String(fastSnapshot.stale)} refreshing=${String(fastSnapshot.refreshing)}` +
-    ` ageMs=${String(fastSnapshot.ageMs)} | 缺 pid 的服务 ${missingPid}/${fastSnapshot.services.length}`,
+    `fast #${index}: ${elapsedMs}ms | cached=${String(timing.returnedFromCache)} tier=${String(timing.tier)}` +
+    ` degraded=${String(timing.degraded)} refreshing=${String(timing.refreshing)} ageMs=${String(timing.ageMs)}` +
+    ` cacheMiss=${String(timing.cacheMiss)} | 缺 pid 的服务 ${missingPid}/${fastSnapshot.services.length}`,
   )
 }
 const fastSorted = [...fastTimes].sort((a, b) => a - b)

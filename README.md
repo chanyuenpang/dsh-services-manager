@@ -102,13 +102,48 @@ dsh plugin --profile web add G:/Projects/dsh-plugins/dsh-services-manager
 ## 开发与验证
 
 ```powershell
-npm test                          # 15 个单测：netstat 解析、签名正反例、配置校验/原子写/冲突、命令分词
-node scripts/verify-host.mjs 4599 # 真机验证：不重启 dsh，用最小 seam 替身驱动真实 RPC 面
+npm test                            # 15 个单测：netstat 解析、签名正反例、配置校验/原子写/冲突、命令分词
+node scripts/verify-host.mjs 4599   # 真机验证：不重启 dsh，用最小 seam 替身驱动真实 RPC 面
+node scripts/verify-lifecycle.mjs 4598  # autostart 拉起 → restart 换 PID → dispose 释放端口
+node scripts/verify-rpc-http.mjs "<token url>"  # 真实 HTTP 层：信封字段 + 快层首屏耗时
+node scripts/bench-snapshot.mjs 5   # 快照耗时基线 + 「事件循环是否被阻塞」的客观测法
 ```
 
 `scripts/verify-host.mjs` 会核对：`snapshot` 与本机 `netstat` 逐行一致、配置冲突/非法被拒、
 真实启动一个临时 HTTP 服务（端口真的起来、PID 可读、日志可取）、停止后端口真的释放、
 以及**签名不匹配时拒绝终止且该进程仍存活**。
+
+## 快照的两层与新鲜度（v2）
+
+读取分两层，客户端**先上屏再补齐**：
+
+| 层 | 内容 | 实测（本机 3 条服务） |
+| --- | --- | --- |
+| 快层 | 快照缓存命中（1.5s TTL）或并行本机 TCP 探测（250ms 超时）→ status / ownership | **0 ms**（命中）/ 2–5 ms（未命中） |
+| 详层 | `netstat` 取 PID + 按 PID **永久缓存**取命令行 → pid / commandLine | 热 290–514 ms，冷 ~2.5 s；**不阻塞用户可见路径** |
+
+**端点**：`snapshot.fast`（首屏，永远不等详层）、`snapshot.full`（显式刷新/需要 pid 时用，等详层刷新完成）。
+`snapshot` 旧调用等价于 `snapshot.full`（`{mode:'fast'|'full'}` 也仍兼容）。
+
+**新鲜度由宿主计算、客户端只投影**，都在 `value.timing` 里：
+
+| 字段 | 含义 |
+| --- | --- |
+| `collectedAt` / `servedAt` / `ageMs` | 这份观测何时采到、何时发出、现在多大年纪 |
+| `tier` | `1` = 只有端口层（pid/命令行可能是空的）；`2` = 含详层 |
+| `returnedFromCache` | 本次是否直接命中快照缓存（0 ms 路径） |
+| `refreshing` | 后台正在补齐详层 |
+| `degraded` | 详层已偏旧（>5s），显示的值可能过期 |
+| `cacheMiss` | 宿主手上**没有任何**观测（首帧）：界面必须显示骨架，而不是「0 个服务」 |
+| `revision` | 运行态版本，只增 |
+
+客户端约定：只把快照当投影，任何决策都不依赖它；`tier:1` 时 `pid`/`commandLine` 显示「读取中」而不是
+「未知」；`degraded` 必须让用户看得出来这份数据不是刚刚采到的。
+
+> **诚实的残留**：Windows 上异步 spawn 一个进程本身仍会让事件循环停 ~0.1–0.25 s（实测心跳最坏间隔
+> 111–227 ms）。所以本插件不声称「零阻塞」，而是把这段成本**从用户可见路径与重复路径里移走**：
+> 首屏 0 ms，且稳态下每 30s 才可能触发一次详层刷新（旧实现是每 4s 阻塞 1.8s）。
+> 想彻底消除需要常驻探测助手进程 —— 那是后续项，不在本版范围。
 
 ## 架构（三句话）
 
@@ -116,9 +151,10 @@ node scripts/verify-host.mjs 4599 # 真机验证：不重启 dsh，用最小 sea
 - 浏览器半边 `lib/client.js` 是手写的 `window.__ModuleLoader__.load({...})` 单文件 bundle，注册 `settings.section`，只通过 `ctx.connection.rpc.call` 与宿主通信。
 - 监管核心 `src/supervisor.mjs`：活性以端口为准，所有权分 `spawned` / `discovered`，终止外部进程前必须通过命令行签名校验。
 
-RPC 端点：`snapshot`、`start`、`stop`、`restart`、`restart-dsh`、`config.get`、`config.set`、`logs`；
-返回 `{ ok: true, data }` 或 `{ ok: false, error: { code, message, details? } }`；
-错误码：`SERVICE_NOT_FOUND`、`PORT_OWNED_BY_OTHER`、`CONFIG_CONFLICT`、`CONFIG_INVALID`、`ALREADY_SCHEDULED`、`TIMEOUT`、`OPERATION_FAILED`。
+RPC 端点：`snapshot`（入参见上节 `mode`）、`start`、`stop`、`restart`、`restart-dsh`、`config.get`、`config.set`、`logs`；
+信封是 `{ ok: true, value }` / `{ ok: false, error: { code, message, details } }`
+（字段名是 **`value`**，且 `details` 是必填对象 —— 传输层按 schema 会剥掉未知键，写错字段名会让浏览器只收到 `{ ok: true }`）；
+错误码：`SERVICE_NOT_FOUND`、`PORT_OWNED_BY_OTHER`、`CONFIG_CONFLICT`、`CONFIG_INVALID`、`ALREADY_SCHEDULED`、`UNKNOWN_ENDPOINT`、`TIMEOUT`、`OPERATION_FAILED`。
 
 ## 已知限制
 
