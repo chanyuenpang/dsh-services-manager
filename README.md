@@ -121,6 +121,7 @@ pwsh -File scripts/preview-sandbox.ps1 -Stop  # 看完停掉
 
 > 改**客户端**（`lib/client.js`）后刷新预览页即可生效；改**宿主**（`src/**`）必须重启实例，且按
 > `AGENTS.md` 先过沙箱门禁 4 项才允许挂正式 profile。
+> 预览时请用**硬刷新**（Ctrl+Shift+R）：客户端 bundle 走的是 `immutable` 长缓存，普通刷新可能仍用旧 bundle。
 
 `scripts/verify-host.mjs` 会核对：`snapshot` 与本机 `netstat` 逐行一致、配置冲突/非法被拒、
 真实启动一个临时 HTTP 服务（端口真的起来、PID 可读、日志可取）、停止后端口真的释放、
