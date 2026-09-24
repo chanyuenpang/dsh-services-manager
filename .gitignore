@@ -1,0 +1,7 @@
+# claw-kit
+.claw/*
+!.claw/project.json
+!.claw/truth/
+!.claw/truth/**
+.claw/project-override.json
+.gitnexus
