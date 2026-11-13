@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Services manager",
+    "description": "Inspect background services, manage persistent start policies and service configuration, and safely restart the current DSH."
+  }
+}

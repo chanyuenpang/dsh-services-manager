@@ -34,38 +34,8 @@ export function revisionOf(raw) {
   return crypto.createHash('sha256').update(String(raw), 'utf8').digest('hex').slice(0, 16)
 }
 
-/**
- * 首次运行的默认配置：只有本机已实测存在的两条服务。
- * dsh 自己是内置条目（不写进配置文件），所以这里不重复声明它。
- */
-export const DEFAULT_CONFIG = {
-  version: 1,
-  services: [
-    {
-      id: 'mechanics-web',
-      title: 'Mechanics Web',
-      port: 4319,
-      url: 'http://127.0.0.1:4319/',
-      // 启动命令走 shell 执行，所以 PATH 里的命令可以直接写（mech 是全局 bin，不必写全路径）。
-      command: 'mech web',
-      cwd: 'G:\\Projects\\mechanics',
-      autostart: false,
-      autoStopOnExit: true,
-      match: { commandLinePattern: '@veewo[\\\\/]mechanics[\\\\/]src[\\\\/]server[\\\\/]cli\\.mjs"?\\s+web' },
-    },
-    {
-      id: 'tiny-world-web',
-      title: 'tiny-world Web 原型',
-      port: 5173,
-      url: 'http://127.0.0.1:5173/',
-      command: 'npm run dev -- --host 127.0.0.1 --port 5173 --strictPort',
-      cwd: 'G:\\Projects\\tiny-world\\Web Prototype',
-      autostart: false,
-      autoStopOnExit: true,
-      match: { commandLinePattern: 'vite[\\\\/]bin[\\\\/]vite\\.js.*--port 5173|tinypool|tiny-world.*vite' },
-    },
-  ],
-}
+/** 新安装不带任何本机定义；已有 services.json 原样保留。 */
+export const DEFAULT_CONFIG = { version: 1, services: [] }
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i
 
@@ -174,6 +144,27 @@ export function readConfig(configPath) {
   return { raw, revision: revisionOf(raw), services, issues }
 }
 
+/** 同一宿主内同步提交意图：读最新整份配置，只改目标字段，不隔离丢弃坏条目。 */
+export function setAutostart(configPath, id, autostart) {
+  const current = readConfig(configPath)
+  if (current.issues.length > 0) {
+    const error = new Error('配置含无效条目，请先修复再修改启停策略。')
+    error.code = 'CONFIG_INVALID'
+    error.details = { path: configPath, issues: current.issues }
+    throw error
+  }
+  const definition = current.services.find((entry) => entry.id === id)
+  if (!definition) {
+    const error = new Error(`没有 id 为 ${id} 的服务定义`)
+    error.code = 'SERVICE_NOT_FOUND'
+    throw error
+  }
+  const parsed = JSON.parse(current.raw)
+  parsed.services.find((entry) => entry.id.trim() === id).autostart = autostart
+  const saved = saveConfig(configPath, JSON.stringify(parsed), current.revision, { preserveFields: true })
+  return { ...saved, definition: { ...definition, autostart } }
+}
+
 /** 供 config.get 使用：只读，不创建文件之外的副作用。 */
 export function readConfigRaw(configPath) {
   const { raw, revision } = readConfig(configPath)
@@ -184,7 +175,7 @@ export function readConfigRaw(configPath) {
  * 原子保存配置（单写者 + 临时文件 rename + expectedRevision）。
  * @throws {Error & {code:string, details?:object}} CONFIG_CONFLICT / CONFIG_INVALID
  */
-export function saveConfig(configPath, raw, expectedRevision) {
+export function saveConfig(configPath, raw, expectedRevision, { preserveFields = false } = {}) {
   const current = readConfig(configPath)
   if (typeof expectedRevision === 'string' && expectedRevision !== '' && expectedRevision !== current.revision) {
     const error = new Error('配置文件已被外部修改，请重新载入后再保存。')
@@ -232,7 +223,7 @@ export function saveConfig(configPath, raw, expectedRevision) {
       return out
     }),
   }
-  const text = `${JSON.stringify(normalized, null, 2)}\n`
+  const text = `${JSON.stringify(preserveFields ? parsed : normalized, null, 2)}\n`
   fs.mkdirSync(path.dirname(configPath), { recursive: true })
   const temporary = path.join(path.dirname(configPath), `.services.${process.pid}.${Date.now()}.tmp`)
   fs.writeFileSync(temporary, text, 'utf8')

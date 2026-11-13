@@ -1,10 +1,9 @@
 /**
- * Restart the `dsh web` that owns a port — including the one hosting this conversation.
+ * Restart the DSH 0.2 Web or Desktop runtime that owns a port.
  *
- * Global version, packaged as the `dsh-restart` skill. The repository copy
- * (`<repo>/tools/restart-host.mjs`) is the same logic wired to that repo's own flow and covered
- * by its unit tests; this one has **no repository dependency** so any agent, in any project, can
- * restart DSH.
+ * Web targets relaunch their exact `@deepseek-ai/dsh/lib/bin.js` installation. Desktop targets
+ * prove the `dsh-desktop-host` listener, walk to its Electron root, stop only that application
+ * tree, strip Node-mode environment flags, and relaunch the same `DeepSeek Harness.exe`.
  *
  * The job is two statements: stop it, start it. Everything else here exists because of two
  * measured facts (the reasoning is in that repo's ADR-0009), and nothing else is kept:
@@ -12,29 +11,29 @@
  * 1. The process running those statements is a **child of the process being stopped**, inside a
  *    Windows job object belonging to the command that started it — so the kill is done by a
  *    supervisor started through **WMI**, which no job of ours owns.
- * 2. The instance it starts must be **detached with its output on a file**: non-detached it dies
- *    with the supervisor, and piped output is an EPIPE that DSH's fail-loud handler turns into
- *    `exit(1)`. Both killed the instance that had just come up.
+ * 2. The replacement must be detached. Web output goes to a file; Desktop owns its own output.
+ *    A piped Web output is an EPIPE that DSH's fail-loud handler turns into `exit(1)`.
  *
  * It does not verify anything. Whether the new instance came up is a question for whoever looks
  * next (`/status`, or the log this writes), and a restart a person performs by hand does not
  * verify either.
  *
  * **Announce before you apply.** A restart kills the process that owns the conversation: the
- * agent goes offline, and the page needs the new instance's token. The 60s default grace exists
- * so the warning can be read first — and the skill on top of this script additionally requires an
- * `ask_user_question` answer before `--apply` is run at all.
+ * agent goes offline; Web needs the new token, while Desktop closes and reopens the app. The former 60s grace
+ * was a communication buffer, not a process requirement. The 3s default starts only after
+ * explicit consent; the current reply may be interrupted, so warn before `--apply`.
  *
- * The stop half is a **sweep, not one kill**: after the instance on the port is stopped, the
- * other processes this DSH owns are stopped too — its command subprocesses
+ * Web's stop half is a **sweep, not one kill**: after the instance on the port is stopped, the
+ * other processes this DSH installation owns are stopped too — its command subprocesses
  * (`dsh-subprocess-local/lib/runner.js`, the thing actually holding a pwsh/cmd/node command), its
  * own worker children, and the orphans a previous instance left behind. A `dsh` tree that is only
  * half gone is what makes the next start look hung, so the sweep runs before the relaunch rather
- * than after it. `--keep-sandboxes` narrows it back to the target's own tree.
+ * than after it. `--keep-sandboxes` narrows it back to the target's own tree. Desktop always
+ * stops only the proved Electron application tree and never runs the installation-wide sweep.
  *
  * Windows only (WMI + Win32_Process + netstat). Usage:
  *   node restart-dsh.mjs                            # dry run: what would happen
- *   node restart-dsh.mjs --apply --grace 60         # do it, 60s from now (the default)
+ *   node restart-dsh.mjs --apply --grace 3          # do it, ~3s after the supervisor starts (the default)
  *   node restart-dsh.mjs --port 3081 --apply        # another instance
  *   node restart-dsh.mjs --cwd G:\some\project      # what the new instance's sessions work in
  *   node restart-dsh.mjs --keep-sandboxes --apply   # stop the target tree only
@@ -53,10 +52,9 @@ const settle = (ms) => new Promise((done) => setTimeout(done, ms));
 
 /** `--apply` is the only thing that changes behaviour; a dry run is the default. */
 export function parseArgs(argv) {
-  // 60s, not 20: an agent that restarts this instance must first say so in the conversation, and
-  // the message and the disconnect arriving together is the same as no warning at all
-  // (「如果有重启的话一定要提前告诉我，不然我不知道你已经掉线了」).
-  const options = { apply: false, graceSeconds: 60, port: 3080, dshHome: null, cwd: process.cwd(), logDir: defaultLogDir, keepSandboxes: false };
+  // Three seconds are not a message-delivery barrier: skill callers must obtain single-use
+  // consent and warn that this turn may be cut off before they invoke --apply.
+  const options = { apply: false, graceSeconds: 3, port: 3080, dshHome: null, cwd: process.cwd(), logDir: defaultLogDir, keepSandboxes: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === '--apply') options.apply = true;
@@ -84,7 +82,8 @@ export function launchArgsFrom(commandLine) {
   const text = typeof commandLine === 'string' ? commandLine : '';
   const marker = text.lastIndexOf('bin.js');
   if (marker === -1) return [];
-  const tail = text.slice(marker + 'bin.js'.length).trim();
+  // 引号路径在 bin.js 后还有一个闭引号；先去掉它再读取必需的子命令。
+  const tail = text.slice(marker + 'bin.js'.length).trim().replace(/^["']\s*/, '');
   const args = [];
   const subcommand = tail.match(/^([a-zA-Z][\w-]*)/);
   if (subcommand !== null) args.push(subcommand[1]);
@@ -141,13 +140,62 @@ export function isDshProcess(commandLine) {
 
 function commandLines() {
   try {
-    const json = execFileSync('powershell', ['-NoProfile', '-Command', "Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'node*' -or $_.Name -like 'dsh*' } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress"], { encoding: 'utf8' });
+    // Desktop 的监听者是 Electron Node-mode 子进程，镜像名是 `DeepSeek Harness.exe`，
+    // 不能再用 node*/dsh* 预过滤。取完整进程表后只在 JS 里按严格命令行标记筛选。
+    const json = execFileSync('powershell', ['-NoProfile', '-Command', 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress'], { encoding: 'utf8' });
     const parsed = JSON.parse(json.trim() === '' ? '[]' : json);
     return Array.isArray(parsed) ? parsed : [parsed];
   } catch {
-    // No CIM, no sweep: the caller still stops the target it found through netstat.
+    // No CIM: caller must refuse targets whose identity/parent chain cannot be proved.
     return [];
   }
+}
+
+/** Desktop Host 的唯一稳定身份标记（它不是 `bin.js web`）。 */
+export function isDesktopHostProcess(commandLine) {
+  return typeof commandLine === 'string'
+    && /@deepseek-ai[\\/]dsh-desktop-host[\\/]lib[\\/]index\.js/i.test(commandLine);
+}
+
+/** 从目标 Web Host 命令行提取它实际使用的 bin.js，避免错误切到另一份全局安装。 */
+export function webEntryFrom(commandLine) {
+  const text = typeof commandLine === 'string' ? commandLine : '';
+  const match = text.match(/(?:"([^"]*@deepseek-ai[\\/]dsh[\\/]lib[\\/]bin\.js)"|([^\s"]*@deepseek-ai[\\/]dsh[\\/]lib[\\/]bin\.js))/i);
+  return match?.[1] ?? match?.[2] ?? null;
+}
+
+/**
+ * 把端口监听者解析成可证明的重启目标。
+ * Desktop 沿父链找到同一 Electron 可执行文件的最高祖先（应用主进程）；Web 只接受 bin.js。
+ */
+export function restartTargetFrom(listener, rows) {
+  if (!Number.isInteger(listener) || listener <= 0) return null;
+  const table = new Map((Array.isArray(rows) ? rows : []).map((row) => [Number(row?.ProcessId), row]));
+  const target = table.get(listener);
+  const commandLine = target?.CommandLine ?? '';
+  const webArgs = launchArgsFrom(commandLine);
+  const webEntry = webEntryFrom(commandLine);
+  if (webArgs.length > 0 && webEntry !== null) {
+    return { kind: 'web', listenerPid: listener, stopPid: listener, executablePath: process.execPath, entryPath: webEntry, args: webArgs };
+  }
+  if (!isDesktopHostProcess(commandLine)) return null;
+  const executablePath = typeof target?.ExecutablePath === 'string' && target.ExecutablePath !== '' ? target.ExecutablePath : null;
+  if (executablePath === null) return null;
+  let root = target;
+  const visited = new Set([listener]);
+  for (let depth = 0; depth < 20; depth += 1) {
+    const parentId = Number(root?.ParentProcessId);
+    if (!Number.isInteger(parentId) || parentId <= 0 || visited.has(parentId)) break;
+    visited.add(parentId);
+    const parent = table.get(parentId);
+    if (parent === undefined) break;
+    const parentExecutable = typeof parent.ExecutablePath === 'string' ? parent.ExecutablePath : '';
+    if (parentExecutable.toLowerCase() !== executablePath.toLowerCase()) break;
+    root = parent;
+  }
+  const stopPid = Number(root?.ProcessId);
+  if (!Number.isInteger(stopPid) || stopPid <= 0 || stopPid === listener) return null;
+  return { kind: 'desktop', listenerPid: listener, stopPid, executablePath, entryPath: null, args: [] };
 }
 
 function isAlive(pid) {
@@ -264,51 +312,94 @@ function logTo(logFile, line) {
   appendFileSync(logFile, `${new Date().toISOString()} ${line}\n`, 'utf8');
 }
 
-/** The detached half: stop (the tree), then start. Two statements, and a line for each. */
+/**
+ * WMI 不继承 Desktop Host 的 ELECTRON_RUN_AS_NODE，不能拿 Electron exe 直接执行 .mjs。
+ * 桌面安装随包提供真实 node.exe；Web/开发环境继续使用当前 node.exe。
+ */
+export function supervisorNodeExecutable(executable = process.execPath) {
+  if (/[\\/]node(?:\.exe)?$/i.test(executable) && existsSync(executable)) return executable;
+  const bundled = join(dirname(executable), 'resources', 'runtime', 'primary-runtime', 'dependencies', 'node', 'bin', process.platform === 'win32' ? 'node.exe' : 'node');
+  return existsSync(bundled) ? bundled : null;
+}
+
+/** Desktop 应用不能继承 Electron 的 Node-mode 开关，否则 exe 只会当成 node 运行。 */
+export function desktopLaunchEnvironment(environment = process.env) {
+  const next = { ...environment };
+  delete next.ELECTRON_RUN_AS_NODE;
+  delete next.DSH_DESKTOP_NODE_EXECUTABLE;
+  delete next.NODE_CHANNEL_FD;
+  delete next.NODE_CHANNEL_SERIALIZATION_MODE;
+  return next;
+}
+
+/** The detached half: stop the proved target tree, then start the same runtime kind. */
 async function supervise({ port, graceSeconds, dshHome, cwd, logDir, keepSandboxes }) {
   const logFile = join(logDir, 'host-restart.log');
   const childLog = join(logDir, 'dsh-web.log');
   const log = (line) => logTo(logFile, line);
   const oldPid = listenerPid(port);
-  const args = oldPid === null ? [] : launchArgsFrom(commandLineOf(oldPid));
-  log(`restart: port ${port}, target ${oldPid ?? 'none'}, grace ${graceSeconds}s, args ${JSON.stringify(args)}, cwd ${cwd}`);
-  if (oldPid !== null && args.length === 0) {
-    log('refusing: the target has no readable subcommand, so a relaunch would start `dsh` bare');
+  const rows = commandLines();
+  const target = oldPid === null ? null : restartTargetFrom(oldPid, rows);
+  log(`restart: port ${port}, listener ${oldPid ?? 'none'}, kind ${target?.kind ?? 'unknown'}, stop ${target?.stopPid ?? 'none'}, grace ${graceSeconds}s, args ${JSON.stringify(target?.args ?? [])}, cwd ${cwd}`);
+  if (target === null) {
+    log('refusing: the listener is absent or is not a proved DSH Web/Desktop host');
     process.exit(1);
   }
-  if (oldPid !== null) {
-    await settle(Math.max(0, graceSeconds) * 1000);
+
+  await settle(Math.max(0, graceSeconds) * 1000);
+  if (target.kind === 'desktop') {
     try {
-      process.kill(oldPid);
+      // The Host is only one child of Electron. Stop the app root and its exact descendants;
+      // never sweep other Desktop/Web instances from another tree.
+      execFileSync('taskkill', ['/PID', String(target.stopPid), '/T', '/F'], { encoding: 'utf8', windowsHide: true });
+    } catch (error) {
+      log(`desktop tree stop failed: ${error.message}`);
+    }
+  } else {
+    try {
+      process.kill(target.listenerPid);
     } catch (error) {
       log(`kill failed: ${error.message}`);
     }
-    for (let attempt = 0; attempt < 20 && listenerPid(port) !== null; attempt += 1) await settle(250);
+    await sweepDshProcesses({ pid: target.listenerPid, keepSandboxes, log });
   }
-  // Stop before starting: the sweep is here, not after the relaunch, so nothing of the old tree
-  // is still holding a shell, a pipe or a log file while the new instance opens its own.
-  await sweepDshProcesses({ pid: oldPid, keepSandboxes, log });
-
-  const globalBin = join(process.env.APPDATA ?? '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
-  if (!existsSync(globalBin)) {
-    log(`cannot find ${globalBin}; start the instance by hand`);
+  for (let attempt = 0; attempt < 40 && listenerPid(port) !== null; attempt += 1) await settle(250);
+  if (listenerPid(port) !== null) {
+    log(`refusing: port ${port} is still listening after target shutdown`);
     process.exit(1);
   }
-  mkdirSync(logDir, { recursive: true });
-  const sink = openSync(childLog, 'a');
-  const child = spawn(process.execPath, [globalBin, ...args], {
-    cwd,
-    env: dshHome === null || dshHome === undefined ? process.env : { ...process.env, DSH_HOME: dshHome },
-    stdio: ['ignore', sink, sink],
-    detached: true,
-    // Never give the relaunched instance a window: it is a background service, and a stray
-    // console on the user's desktop both distracts them and invites a fatal mis-click
-    // (closing that window kills the Host).
-    windowsHide: true,
-  });
-  closeSync(sink);
+
+  let child;
+  if (target.kind === 'desktop') {
+    if (!existsSync(target.executablePath)) {
+      log(`cannot find desktop executable ${target.executablePath}; start the app by hand`);
+      process.exit(1);
+    }
+    child = spawn(target.executablePath, [], {
+      cwd: dirname(target.executablePath),
+      env: desktopLaunchEnvironment(process.env),
+      stdio: 'ignore',
+      detached: true,
+      windowsHide: false,
+    });
+  } else {
+    if (!existsSync(target.entryPath)) {
+      log(`cannot find ${target.entryPath}; start the instance by hand`);
+      process.exit(1);
+    }
+    mkdirSync(logDir, { recursive: true });
+    const sink = openSync(childLog, 'a');
+    child = spawn(target.executablePath, [target.entryPath, ...target.args], {
+      cwd,
+      env: dshHome === null || dshHome === undefined ? process.env : { ...process.env, DSH_HOME: dshHome },
+      stdio: ['ignore', sink, sink],
+      detached: true,
+      windowsHide: true,
+    });
+    closeSync(sink);
+  }
   child.unref();
-  log(`started pid ${child.pid}`);
+  log(`started ${target.kind} pid ${child.pid}`);
   process.exit(0);
 }
 
@@ -322,13 +413,21 @@ if (!isMain) {
 } else {
   const pid = listenerPid(options.port);
   const logFile = join(options.logDir, 'host-restart.log');
-  const cleanup = options.keepSandboxes
-    ? '(not swept: --keep-sandboxes)'
-    : commandLines().filter((row) => isDshProcess(row.CommandLine)).map((row) => row.ProcessId);
+  const rows = commandLines();
+  const target = pid === null ? null : restartTargetFrom(pid, rows);
+  const cleanup = target?.kind === 'desktop'
+    ? [target.stopPid]
+    : options.keepSandboxes
+      ? '(not swept: --keep-sandboxes)'
+      : rows.filter((row) => isDshProcess(row.CommandLine)).map((row) => row.ProcessId);
   console.log(JSON.stringify({
     port: options.port,
     targetPid: pid,
-    relaunchArgs: pid === null ? [] : launchArgsFrom(commandLineOf(pid)),
+    targetKind: target?.kind ?? null,
+    stopPid: target?.stopPid ?? null,
+    relaunchExecutable: target?.executablePath ?? null,
+    relaunchEntry: target?.entryPath ?? null,
+    relaunchArgs: target?.args ?? [],
     dshHome: options.dshHome ?? process.env.DSH_HOME ?? '(inherited default)',
     cwd: options.cwd,
     graceSeconds: options.graceSeconds,
@@ -346,9 +445,13 @@ if (!isMain) {
     }
   }
   if (!options.apply) {
-    console.log('\ndry run: nothing was touched. --apply stops the target, sweeps the rest of the dsh tree, and starts it again.');
-    if (options.keepSandboxes) console.log('--keep-sandboxes: the sweep is limited to the target\'s own tree.');
-    else console.log(`--apply would also stop ${cleanup.length} dsh process(es): pids ${cleanup.join(', ') || '(none)'}.`);
+    console.log('\ndry run: nothing was touched. --apply stops the proved target and starts the same runtime kind again.');
+    if (target?.kind === 'desktop') console.log(`desktop: only application tree ${target.stopPid} is stopped, then ${target.executablePath} is relaunched.`);
+    else if (options.keepSandboxes) console.log('--keep-sandboxes: the Web sweep is limited to the target\'s own tree.');
+    else console.log(`web: --apply would also stop ${Array.isArray(cleanup) ? cleanup.length : 0} dsh process(es): pids ${Array.isArray(cleanup) ? cleanup.join(', ') || '(none)' : cleanup}.`);
+  } else if (target === null) {
+    console.error('\nrefusing: requested port is not owned by a proved DSH Web/Desktop host.');
+    process.exitCode = 1;
   } else {
     // Through WMI: this process is a child of the very pid that is about to die, and a plain
     // `detached` child stays inside the harness's per-command job object (ADR-0009).
@@ -361,7 +464,12 @@ if (!isMain) {
       ...(options.keepSandboxes ? ['--keep-sandboxes'] : []),
       ...(options.dshHome === null ? [] : ['--dsh-home', options.dshHome]),
     ];
-    const commandLine = [process.execPath, ...superviseArgs].map((part) => `"${part}"`).join(' ');
+    const supervisorNode = supervisorNodeExecutable();
+    if (supervisorNode === null) {
+      console.error('\nrefusing: cannot locate a real node executable for the detached supervisor.');
+      process.exit(1);
+    }
+    const commandLine = [supervisorNode, ...superviseArgs].map((part) => `"${part}"`).join(' ');
     let via = 'wmi';
     try {
       // 直接由 WMI 拉起看守进程。**不要**在这里再套一层 `powershell -WindowStyle Hidden`:
@@ -371,12 +479,14 @@ if (!isMain) {
       execFileSync('powershell', ['-NoProfile', '-Command', `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${commandLine.replace(/'/g, "''")}' } | Out-Null`], { encoding: 'utf8' });
     } catch {
       via = 'spawn';
-      const helper = spawn(process.execPath, superviseArgs, { cwd: options.cwd, env: process.env, stdio: 'ignore', detached: true, windowsHide: true });
+      const helper = spawn(supervisorNode, superviseArgs, { cwd: options.cwd, env: process.env, stdio: 'ignore', detached: true, windowsHide: true });
       helper.unref();
     }
     logTo(logFile, `requested: port ${options.port}, grace ${options.graceSeconds}s, via ${via}`);
-    console.log(`\nAPPLY: restarting port ${options.port} in ${options.graceSeconds}s (via ${via}).`);
-    console.log(`stops the target, then the rest of the dsh tree${options.keepSandboxes ? ' (target tree only)' : ''}; then starts the new instance.`);
+    console.log(`\nAPPLY: restarting ${target?.kind ?? 'unknown'} target on port ${options.port} in ${options.graceSeconds}s (via ${via}).`);
+    console.log(target?.kind === 'desktop'
+      ? 'stops only the owning Desktop application tree, then relaunches the application.'
+      : `stops the target, then the rest of the dsh tree${options.keepSandboxes ? ' (target tree only)' : ''}; then starts the new instance.`);
     console.log(`outcome goes to ${logFile}; this process may be killed in the meantime.`);
   }
 }

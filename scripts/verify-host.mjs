@@ -201,7 +201,8 @@ try {
         match: { commandLinePattern: 'definitely-not-this-service' },
       }],
     })
-    const guardSaved = await invoke('config.set', { raw: guardRaw, expectedRevision: saved.revision })
+    const guardRevision = (await invoke('config.get')).revision
+    const guardSaved = await invoke('config.set', { raw: guardRaw, expectedRevision: guardRevision })
     const denied = await refusal('stop', { id: 'guard' })
     assert.equal(denied?.code, 'PORT_OWNED_BY_OTHER', '签名不匹配必须返回 PORT_OWNED_BY_OTHER')
     assert.equal((await listListeners()).get(unrelatedPort), unrelatedPid, '签名不匹配时不得终止该进程')

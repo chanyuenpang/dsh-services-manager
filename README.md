@@ -1,49 +1,64 @@
 # dsh-services-manager
 
-DSH Web 的一个小插件：在**设置页**里加一个「服务管理」分区，用来查看和操作宿主上的后台网络服务
-（`dsh web` 自己、mechanics web、tiny-world Web 原型，以及你自己加进来的任何服务）。
+面向 DSH 0.2 Desktop 与 Web 的服务管理插件：在**设置页**里增加「服务管理」分区，用来查看和操作宿主上的后台网络服务
+（当前 DSH Desktop/Web、mechanics web、tiny-world Web 原型，以及你自己加进来的任何服务）。
 
 - 看状态：端口是否在监听、占用者 PID、是**本插件启动的**还是**外部已存在的**、最近退出码 / 错误、可选 HTTP 健康探测。
 - 一键操作：启动 / 停止 / 重启 / 刷新 / 看日志。
 - 配置驱动：服务定义都在一个 JSON 文件里，面板内可直接编辑并写回（文件是唯一事实来源）。
-- 生命周期：标了 `autostart` 的服务随 `dsh web` 启动自动拉起；`dsh` 退出时停止**由本插件启动的**实例。
-- 一键重启 dsh 自己：面板里点一下，默认 60 秒后重启（页面会断开，需要重新连接）。
+- 持久启停：手动启动先保存 `autostart=true`，手动停止先保存 `false`；重启服务保持原策略。插件加载只恢复 true，退出清理本插件实例不改策略。
+- 一键重启当前 DSH：Desktop 会只重启当前 Electron 应用树并重新打开应用；Web 保留原宿主重启语义。两者都需面板单次确认，约 3 秒后执行。
 
 > 非目标：不做通用进程编排/容器平台，不做跨机器管理。
 
 ## 安装
 
 ```powershell
-# 1) 装进 web profile（本机装成 link:，改源码后重启即生效）
-dsh plugin --profile web add G:/Projects/dsh-plugins/dsh-services-manager
+# 1) 先在隔离沙箱验证，再安装目标 profile；路径换成你持有的离线包
+# DSH 0.2 Desktop
+dsh plugin --profile desktop add C:/Packages/dsh-services-manager-0.2.2.tgz
+# 独立 Web profile 仍可使用：dsh plugin --profile web add ...
 # 上面这条会同时做两件事：加依赖，并把包名加进 profile 的 dsh.profile.bundles
 
-# 2) 重启 dsh（composition / bundle patch / 客户端 bundle 只在进程启动时加载）
+# 2) 用户明确授权本次正式重启后再执行（新进程才加载宿主/bundle）
 ```
 
 重启后打开 **设置 → 服务管理**。导航项用的是通用齿轮图标（DSH 的设置 shell 不支持第三方分区自定义图标）。
 
-**前置要求**：本插件走 `connection.rpc.handle` 注册 RPC 面，因此该 profile 的 `cordis.patch.yml` 必须给 `connection` 行注入 `webServer`：
+**前置要求**：DSH >=0.2.2-rc.1（当前适配基线为 Desktop 0.2.2-rc.1）、Cordis >=4.1。
+插件自行声明 `subprocess`、`connection`、`webServer` 依赖；包内 patch 为 `connection` 补充 `webServer` 并保留当前模板的 `webStartup` 注入，**不需要用户手改 profile**。旧版 `webRuntime` 注入已不适用于此版本；真实沙箱会检查这条兼容链路。
 
-```yaml
-- id: connection
-  inject:
-    - webRuntime
-    - webServer
-```
-
-本机正式的 web profile 早已有这一段；**新建 profile（例如沙箱）必须自己补**，否则插件加载即失败，
-`cannot get property "webServer" without inject` 会让整个 profile 树起不来（已实测）。
+GUI 中通过插件管理器安装本地包；安装结果决定是否即时生效或等待重启。安装并不授权重启，用户可自行重启。插件管理器中提供中英文名称、说明及原创服务图标。
 
 > 开发流程约束：**任何挂进正式 profile 的动作，都必须先在隔离沙箱里通过一次真实启动测试**。
 > 完整做法与踩坑清单见 [`AGENTS.md`](AGENTS.md)。
 
 回滚见 [`docs/安装与回滚.md`](docs/安装与回滚.md)。
 
+## 无源码 CLI（agent 的主要自足入口）
+
+包内自带 `dsh-services`，不注入 skill、不需要开发仓库。完整合同在 **`--help`**，离线也可读；帮助会打印已解析的安装位置：
+
+```powershell
+# profile 安装不保证 PATH 有 bin；以下两种入口等价
+& "<profile>/node_modules/.bin/dsh-services.cmd" --help
+node "<profile>/node_modules/dsh-services-manager/src/cli.mjs" --help
+# 仅安装 CLI 的离线独立目录（Cordis peer 由实际 DSH 宿主提供）
+npm install --offline --ignore-scripts --legacy-peer-deps --no-audit --no-fund C:/Packages/dsh-services-manager-0.2.2.tgz
+```
+
+显式设置 `DSH_SERVICES_URL=http://127.0.0.1:<port>`，token 由用户从授权的 DSH 访问 URL 私下提供，放 `DSH_SERVICES_TOKEN` 或受保护 stdin（`--token-stdin` 第一行）。不把 token 放命令参数/聊天/日志；不扫描其他 profile、猜测 token。仅支持 loopback，localhost 固定为 127.0.0.1；认证沿用 token→cookie→原有 /dsh-services RPC，禁止跟随重定向。该凭据是现有宿主权限，**不是 agent 权限沙箱**。
+
+常用命令：`register --file service.json`（或 `--file -` 读 stdin）、`list`、`get`、`start ID`、`stop ID`。登记要求显式稳定合法 id；新条目须含 command/cwd/port/非空安全签名。已有 id 只合并显式字段及嵌套键，未知字段拒绝，不自动截断/改名、不启动进程。UI 表单仍支持自动 id 与端口推断。
+
+register/remove 先读当前 revision，由宿主在同步提交内以 expectedRevision 原子保存（单宿主写者，不是跨进程事务）。冲突退出 5：`get` 读回、核对后以 `--revision 新值` 重提相同 id，不盲重试。坏条目拒绝修改，不丢弃。启停执行失败可能已经保存策略，应看 error.details.policyCommitted/autostart/configRevision；断线后先 get/list。CLI 不直接改配置、不启动第二个 manager、不提供宿主重启入口。
+
+`private:true` 保留，交付方式是本地 `npm pack` tarball，不发布 registry。`npm run verify-cli-package` 从全新含空格目录离线安装包，并从非仓库 cwd 验证直接入口与 .bin；隔离 HTTP 客户端测试不等于真实 DSH 沙箱上线门禁（另见安装文档）。
+
 ## 配置
 
 配置文件：`<DSH_HOME>/.dsh-services-manager/services.json`（`DSH_HOME` 缺省为 `~/.dsh`）。
-首次运行会自动写入一份包含本机两条真实服务的默认配置（mechanics web、tiny-world Web 原型）。
+首次运行仅在文件不存在时写入 `{"version":1,"services":[]}`。没有本机路径或预置服务；升级绝不覆盖已有 `services.json`。下面只是示例，请替换成你自己的路径。
 
 ```jsonc
 {
@@ -56,10 +71,10 @@ dsh plugin --profile web add G:/Projects/dsh-plugins/dsh-services-manager
       "host": "127.0.0.1",                // 探测地址，缺省 127.0.0.1
       "url": "http://127.0.0.1:4319/",    // 面板上的「打开」链接，缺省由 host+port 推导
       "command": "node \"C:\\...\\cli.mjs\" web --port 4319",  // 必填，启动命令
-      "cwd": "G:\\Projects\\mechanics",    // 必填，工作目录
+      "cwd": "C:/Services/My API",        // 必填，替换为宿主上的工作目录
       "autostart": false,                  // dsh 启动时是否自动拉起
       "autoStopOnExit": true,              // dsh 退出时是否停止「本插件启动的」实例
-      "takeover": "match",                 // match（默认，要求签名匹配）| force（允许无条件接管）
+      "takeover": "match",                 // 必须签名匹配；旧 force 不再绕过校验
       "match": { "commandLinePattern": "@veewo[\\\\/]mechanics..." },  // 端口占用者的身份校验（RegExp 源串，大小写不敏感）
       "probe": { "path": "/health", "expectStatus": 200 },             // 可选 HTTP 健康探测
       "env": { "NODE_ENV": "development" }                             // 可选，显式注入的环境变量
@@ -99,7 +114,7 @@ dsh plugin --profile web add G:/Projects/dsh-plugins/dsh-services-manager
 点「重启 DSH」会先确认，然后由一个**分离的看守进程**执行（与 `dsh-restart` skill 同源、已在本机反复验证的形态）：
 
 1. 记录 `requested:` 到 `<stateDir>/logs/host-restart.log`；
-2. 等待 grace（默认 60 秒，面板里可看到倒计时；下限 15 秒，不允许静默为 0）；
+2. 面板确认后由看守等待 grace 3 秒再开始停旧进程（下限 3 秒；未指定的宿主 RPC 仍默认 60 秒）。`dsh-restart` skill 也默认 3 秒，但每次必须单独明确同意并事先告知当前回复可能中断；
 3. 停掉 3080 上的目标进程，并清扫这次 DSH 安装留下的进程树（含孤儿的命令子进程）；
 4. 等端口释放后，按旧进程的命令行 detached 启动新实例，输出落到 `logs/dsh-web.log`；
 5. 新实例的 token URL 在它自己日志的最后一行。
@@ -109,7 +124,8 @@ dsh plugin --profile web add G:/Projects/dsh-plugins/dsh-services-manager
 ## 开发与验证
 
 ```powershell
-npm test                            # 15 个单测：netstat 解析、签名正反例、配置校验/原子写/冲突、命令分词
+npm test                            # 配置/持久启停/登记/CLI HTTP/客户端回归
+npm run verify-cli-package           # 离线 tarball、新目录安装、任意 cwd 的 bin/help 与隔离认证 HTTP
 node scripts/verify-host.mjs 4599   # 真机验证：不重启 dsh，用最小 seam 替身驱动真实 RPC 面
 node scripts/verify-lifecycle.mjs 4598  # autostart 拉起 → restart 换 PID → dispose 释放端口
 node scripts/verify-rpc-http.mjs "<token url>"  # 真实 HTTP 层：信封字段 + 快层首屏耗时
@@ -166,20 +182,20 @@ pwsh -File scripts/preview-sandbox.ps1 -Stop  # 看完停掉
 - 监管核心 `src/supervisor.mjs`：活性以端口为准，所有权分 `spawned` / `discovered`，终止外部进程前必须通过命令行签名校验。
 
 RPC 端点：`snapshot`（入参见上节 `mode`）、`snapshot.fast`、`snapshot.full`、`start`、`stop`、`restart`、`restart-dsh`、
-`config.get`、`config.set`（整份 JSON）、`config.upsert`（表单：按 id 新增/更新一条）、`config.remove`、`logs`；
+`config.get`、`config.set`（整份 JSON）、`config.upsert`（表单；`registration:true` 为 CLI 严格登记）、`config.remove`、`logs`；
 信封是 `{ ok: true, value }` / `{ ok: false, error: { code, message, details } }`
 （字段名是 **`value`**，且 `details` 是必填对象 —— 传输层按 schema 会剥掉未知键，写错字段名会让浏览器只收到 `{ ok: true }`）；
-错误码：`SERVICE_NOT_FOUND`、`PORT_OWNED_BY_OTHER`、`CONFIG_CONFLICT`、`CONFIG_INVALID`、`ALREADY_SCHEDULED`、`UNKNOWN_ENDPOINT`、`TIMEOUT`、`OPERATION_FAILED`。
+错误码：`SERVICE_NOT_FOUND`、`PORT_OWNED_BY_OTHER`、`CONFIG_CONFLICT`、`CONFIG_INVALID`、`ALREADY_SCHEDULED`、`UNSUPPORTED_RUNTIME`、`UNKNOWN_ENDPOINT`、`TIMEOUT`、`OPERATION_FAILED`。
 
 ## 已知限制
 
 - 分区图标固定为齿轮（DSH 设置 shell 的 `navIcon` 是硬编码 if 链，没有第三方扩展点）。
 - 服务日志来自托管进程的 collected 输出（内存 tail 64KB + 落盘 spill）；`dsh` 重启后旧日志不再可得。
 - 不支持管道/重定向类命令；需要的话请自己写一个脚本，把脚本路径填进 `command`。
-- 只支持 Windows（`netstat` / `taskkill` / `cmd.exe` 路径）；POSIX 上还有 `launchArgv` 的 sh 分支未经真机验证。
+- 自重启只支持 Windows（`netstat` / `taskkill` / WMI）；Desktop 0.2 当前没有公开的应用重启 IPC，插件通过脱离应用树的看守强制停止当前 Electron 树并重新启动同一 exe，因此正在执行的任务会中断。
+- POSIX 上 `launchArgv` 的 sh 分支未经真机验证，且不提供自重启。
 
 ## 来源与致谢
 
-- 重启机制来自 `dsh-restart` skill 的 `restart-dsh.mjs`（`src/restart-supervisor.mjs` 是其原样副本），
-  其原理记录在 `G:\Projects\DSH-cindy-host\.claw\adr\0009-restarting-the-instance-that-hosts-the-session.md`。
+- Web 重启机制最初来自 `dsh-restart` skill；`src/restart-supervisor.mjs` 已扩展为 DSH 0.2 Desktop/Web 双运行时实现，不再是原样副本。
 - 领域与合同设计：`.claw/tasks/2026-09-24/dsh-services-manager-插件/feature-architecture/2026-09-24-1429-宿主后台服务管理插件设计.md`。

@@ -13,8 +13,12 @@
  * **故意不碰 `restart-dsh`** —— 那会真的安排一次重启；要验调度请用长 grace 并立刻杀掉看守进程。
  */
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 
-const target = process.argv[2]
+// Read only this explicitly selected sandbox's private log; never print its token.
+const target = process.argv[2] === '--log'
+  ? fs.readFileSync(process.argv[3], 'utf8').match(/http:\/\/127\.0\.0\.1:\d+\/\?token=[^\s\x1b]+/g)?.at(-1)
+  : process.argv[2]
 if (typeof target !== 'string' || target === '') {
   console.error('用法: node scripts/verify-rpc-http.mjs "http://127.0.0.1:<port>/?token=..."')
   process.exit(2)
@@ -32,6 +36,15 @@ assert.equal(exchange.status, 303, `token 交换必须返回 303，实际 ${exch
 assert.ok(typeof rawCookie === 'string' && rawCookie.length > 0, 'token 交换没有返回 set-cookie')
 const cookie = rawCookie.split(';')[0]
 record('auth', { origin, status: exchange.status, cookieName: cookie.split('=')[0] })
+
+// 1.5) Authenticated application index must contain this plugin in its boot roster.
+const indexResponse = await fetch(`${origin}/`, { headers: { cookie }, redirect: 'manual' })
+assert.equal(indexResponse.status, 200, 'authenticated index must load')
+const html = await indexResponse.text()
+const bootScript = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)]
+  .map((match) => match[1]).find((script) => script.includes('__DSH_BOOT__'))
+assert.ok(bootScript?.includes('dsh-services-manager'), 'client boot roster must include dsh-services-manager')
+record('client-roster', { status: indexResponse.status, plugin: 'dsh-services-manager', present: true })
 
 async function rpc(endpoint, payload = {}) {
   const response = await fetch(`${origin}/dsh-services/${endpoint}`, {

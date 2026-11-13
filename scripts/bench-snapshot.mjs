@@ -6,7 +6,7 @@
  * 并用一个 10ms 定时器统计 snapshot 期间事件循环还转了几圈 —— 同步 execFileSync 会让它接近 0。
  *
  * 用法：node scripts/bench-snapshot.mjs [rounds]
- * 只读：使用真实 DSH_HOME 的配置文件（已存在则不会写），不启动/停止任何服务。
+ * 只读真实配置，复制到临时文件并关闭 autostart；不启动/停止任何服务。
  */
 import fs from 'node:fs'
 import os from 'node:os'
@@ -18,10 +18,14 @@ import { defaultConfigPath } from '../src/config.mjs'
 
 const rounds = Number(process.argv[2] ?? 5)
 const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-bench-'))
-const configPath = defaultConfigPath()
+const sourcePath = defaultConfigPath()
+const configPath = path.join(stateDir, 'services.json')
+const document = fs.existsSync(sourcePath) ? JSON.parse(fs.readFileSync(sourcePath, 'utf8')) : { version: 1, services: [] }
+for (const service of document.services ?? []) if (service && typeof service === 'object') service.autostart = false
+fs.writeFileSync(configPath, JSON.stringify(document))
 const logDir = path.join(stateDir, 'logs')
 
-console.log(`配置（只读）：${configPath}`)
+console.log(`配置（隔离副本，禁用恢复）：${configPath}`)
 console.log(`轮数：${rounds}\n`)
 
 // 分项基线：单次 netstat 与单次按 PID 取命令行

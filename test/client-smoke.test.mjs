@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url'
 const source = fs.readFileSync(fileURLToPath(new URL('../lib/client.js', import.meta.url)), 'utf8')
 
 /** 把 bundle 载进隔离上下文，返回 factory 的返回值（{inject, apply}）与 hook 记录。 */
-function loadBundle() {
+function loadBundle({ confirm = () => { throw new Error("unexpected confirmation") } } = {}) {
   let registered = null
   const documentStub = {
     visibilityState: 'visible',
@@ -27,7 +27,7 @@ function loadBundle() {
     removeEventListener: () => {},
   }
   const sandbox = {
-    window: { __ModuleLoader__: { load: (definition) => { registered = definition } } },
+    window: { confirm, __ModuleLoader__: { load: (definition) => { registered = definition } } },
     document: documentStub,
     console,
     setInterval: () => 1,
@@ -167,7 +167,8 @@ function fakeCall(handlers) {
     calls.push({ endpoint, payload })
     const handler = handlers[endpoint]
     if (handler === undefined) return { ok: false, error: { code: 'UNKNOWN_ENDPOINT', message: 'no handler', details: {} } }
-    return { ok: true, value: handler(payload) }
+    const value = await handler(payload)
+    return value && value.ok === false ? value : { ok: true, value }
   }
   return { call, calls }
 }
@@ -307,7 +308,56 @@ test('内置条目（dsh 自身，managed:false）不显示编辑/启停，只�
   assert.equal(findButton(raw, '编辑配置'), null, '内置条目不得有「编辑配置」')
   assert.equal(findButton(raw, '启动'), null, '内置条目不得有「启动」')
   assert.equal(findButton(raw, '停止'), null, '内置条目不得有「停止」')
-  assert.ok(findButton(raw, '重启 DSH') !== null, '内置条目必须能一键重启 DSH')
+  assert.ok(findButton(raw, '重启 DSH Web') !== null, '内置 Web 条目必须能一键重启 DSH Web')
+})
+
+test('DSH restart confirms interruption before scheduling exactly three seconds', async () => {
+  for (const agreed of [false, true]) {
+    const notices = []
+    const bundle = loadBundle({ confirm: (message) => { notices.push(message); return agreed } })
+    const { call, calls } = fakeCall({
+      'snapshot.fast': () => snapshotValue({ services: [service({ id: 'dsh', managed: false })] }),
+      'restart-dsh': ({ graceSeconds }) => ({ graceMs: graceSeconds * 1000, scheduledAt: '2026-09-29T12:00:00.000Z' }),
+    })
+    const { raw } = await mountAndSettle(bundle, call)
+    assert.equal(calls.filter((entry) => entry.endpoint === 'restart-dsh').length, 0)
+    const button = findButton(raw, '重启 DSH Web')
+    assert.ok(button !== null)
+    button.props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(notices.length, 1)
+    assert.match(notices[0], /约 3 秒开始停旧进程/)
+    assert.match(notices[0], /正在生成的回复或工具任务可能中断/)
+    const scheduled = calls.filter((entry) => entry.endpoint === 'restart-dsh')
+    assert.equal(scheduled.length, agreed ? 1 : 0)
+    if (agreed) {
+      assert.equal(scheduled[0].payload.graceSeconds, 3)
+      bundle.beginRender()
+      const updated = render(registeredComponent(bundle.plugin), { call })
+      assert.ok(updated.text.includes('不是恢复完成时间'))
+      assert.ok(updated.text.includes('安排时刻：'))
+    }
+  }
+})
+
+test('Desktop 自身条目使用应用重启文案且只描述当前应用树', async () => {
+  const notices = []
+  const bundle = loadBundle({ confirm: (message) => { notices.push(message); return true } })
+  const { call, calls } = fakeCall({
+    'snapshot.fast': () => snapshotValue({ services: [service({ id: 'dsh', title: 'DSH Desktop（本应用）', managed: false, runtimeKind: 'desktop', canRestartHost: true })] }),
+    'restart-dsh': ({ graceSeconds }) => ({ graceMs: graceSeconds * 1000, runtimeKind: 'desktop' }),
+  })
+  const { raw } = await mountAndSettle(bundle, call)
+  const button = findButton(raw, '重启 DSH Desktop 应用')
+  assert.ok(button !== null)
+  button.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.match(notices[0], /DSH Desktop 应用/)
+  assert.match(notices[0], /不会清扫其它 DSH 实例/)
+  assert.doesNotMatch(notices[0], /新实例的 token/)
+  assert.equal(calls.filter((entry) => entry.endpoint === 'restart-dsh').length, 1)
+  bundle.beginRender()
+  assert.ok(render(registeredComponent(bundle.plugin), { call }).text.includes('当前应用会关闭并自动重新打开'))
 })
 
 test('表单：填完保存走 config.upsert（不需要用户写 JSON）', async () => {
@@ -396,4 +446,198 @@ test('表单校验：缺名称/命令/目录时给出可读错误且不发请求
   const failed = render(registeredComponent(bundle.plugin), { call })
   assert.ok(failed.text.includes('必填'), '必须给出行内校验错误')
   assert.ok(!calls.some((entry) => entry.endpoint === 'config.upsert'), '校验失败不得发出写请求')
+})
+
+const configValue = (revision, autostart = false) => ({
+  path: 'test/services.json', revision,
+  raw: JSON.stringify({ version: 1, services: [{
+    id: 'mechanics-web', title: 'Mechanics Web', port: 4319,
+    command: 'node cli.mjs web', cwd: 'G:/test', autostart,
+  }] }),
+})
+
+function rerender(bundle, call) {
+  bundle.beginRender()
+  return render(registeredComponent(bundle.plugin), { call })
+}
+
+async function clickAndSettle(tree, label) {
+  const button = findButton(tree.raw, label)
+  assert.ok(button, label)
+  assert.notEqual(button.props.disabled, true, label + ' must be enabled')
+  button.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+for (const status of ['running', 'stopped']) {
+  for (const autostart of [true, false]) {
+    test('policy buttons independent of actual status: ' + status + '/' + autostart, async () => {
+      const bundle = loadBundle()
+      const { call } = fakeCall({
+        'snapshot.fast': () => snapshotValue({ services: [service({ status, autostart })] }),
+        'config.get': () => configValue('rev-1', autostart),
+      })
+      const tree = await mountAndSettle(bundle, call)
+      const card = findByClass(tree.raw, 'svc-card')[0]
+      assert.equal(findButton(card, '启动并').props.disabled, status === 'running' && autostart)
+      assert.equal(findButton(card, '停止并').props.disabled, status === 'stopped' && !autostart)
+      assert.equal(findButton(card, '重启（保留自动启动策略）').props.disabled, status === 'stopped')
+      assert.ok(tree.text.includes('持久策略：自动启动已' + (autostart ? '启用' : '禁用')))
+      assert.ok(tree.text.includes(status === 'running' ? '运行中' : '已停止'))
+      assert.ok(tree.text.includes('启动会持久保存 autostart=true，停止会持久保存 autostart=false；重启保留策略'))
+      assert.ok(tree.titles.includes('实际运行状态'))
+      assert.ok(tree.dataAttrs.includes('data-autostart=' + autostart))
+    })
+  }
+}
+
+for (const [endpoint, label, autostart] of [
+  ['start', '启动并', true], ['stop', '停止并', false], ['restart', '重启（保留', false],
+]) {
+  test(endpoint + ' success refreshes config raw/revision for the next form edit', async () => {
+    const bundle = loadBundle()
+    let changed = false
+    const { call, calls } = fakeCall({
+      'snapshot.fast': () => snapshotValue(),
+      'config.get': () => configValue(changed ? 'rev-2' : 'rev-1', changed ? autostart : false),
+      [endpoint]: () => {
+        changed = true
+        return snapshotValue({ revision: 4, services: [service({ autostart })] })
+      },
+      'config.upsert': () => configValue('rev-3', autostart),
+      'snapshot.full': () => snapshotValue({ revision: 5 }),
+    })
+    const tree = await mountAndSettle(bundle, call)
+    await clickAndSettle(tree, label)
+    const updated = rerender(bundle, call)
+    assert.ok(updated.text.includes('修订 rev-2'))
+    const operation = calls.findIndex((entry) => entry.endpoint === endpoint)
+    assert.equal(calls[operation + 1].endpoint, 'config.get')
+    assert.deepEqual(Object.keys(calls[operation].payload), ['id'])
+    await clickAndSettle(updated, '编辑配置')
+    const form = rerender(bundle, call)
+    await clickAndSettle(form, '保存到配置文件')
+    const upsert = calls.find((entry) => entry.endpoint === 'config.upsert')
+    assert.equal(upsert.payload.expectedRevision, 'rev-2')
+    assert.equal(upsert.payload.service.autostart, autostart)
+  })
+}
+
+for (const [endpoint, label, code, autostart] of [
+  ['start', '启动并', 'PORT_OWNED_BY_OTHER', true],
+  ['stop', '停止并', 'PORT_OWNED_BY_OTHER', false],
+  ['restart', '重启（保留', 'OPERATION_FAILED', false],
+]) {
+  test(endpoint + ' failure keeps committed-policy notice and refreshes without force retry', async () => {
+    let confirms = 0
+    const bundle = loadBundle({ confirm: () => { confirms++; return true } })
+    let failed = false
+    const { call, calls } = fakeCall({
+      'snapshot.fast': () => snapshotValue(),
+      'config.get': () => configValue(failed ? 'rev-2' : 'rev-1', failed ? autostart : false),
+      [endpoint]: () => {
+        failed = true
+        return { ok: false, error: { code, message: 'runtime action failed', details: {
+          policyCommitted: true, autostart, configRevision: 'rev-2', pid: 123,
+        } } }
+      },
+      'snapshot.full': () => snapshotValue({ revision: 4, services: [service({ autostart, status: 'stopped' })] }),
+    })
+    await clickAndSettle(await mountAndSettle(bundle, call), label)
+    const tree = rerender(bundle, call)
+    assert.equal(confirms, 0)
+    assert.equal(calls.filter((entry) => entry.endpoint === endpoint).length, 1)
+    assert.ok(calls.every((entry) => !('force' in entry.payload)))
+    assert.ok(calls.some((entry) => entry.endpoint === 'snapshot.full'))
+    assert.equal(calls.filter((entry) => entry.endpoint === 'config.get').length, 2)
+    assert.ok(tree.text.includes('runtime action failed'))
+    assert.ok(tree.text.includes('持久策略已保存：autostart=' + autostart))
+    assert.ok(tree.text.includes('配置修订 rev-2'))
+    assert.ok(tree.text.includes('本次运行操作未完成；策略不会自动回滚'))
+    assert.ok(tree.text.includes('修订 rev-2'))
+    assert.ok(tree.text.includes('已停止'))
+    assert.ok(!tree.text.includes('强制重试'))
+  })
+}
+
+test('failure refresh errors do not erase operation error or prevent config refresh', async () => {
+  const bundle = loadBundle()
+  const error = (message) => ({ ok: false, error: { code: 'OPERATION_FAILED', message, details: {} } })
+  let configCalls = 0
+  const { call, calls } = fakeCall({
+    'snapshot.fast': () => snapshotValue(),
+    'config.get': () => configValue('rev-' + ++configCalls),
+    start: () => error('original action error'),
+    'snapshot.full': () => error('snapshot refresh error'),
+  })
+  await clickAndSettle(await mountAndSettle(bundle, call), '启动并')
+  const tree = rerender(bundle, call)
+  assert.ok(tree.text.includes('original action error'))
+  assert.ok(tree.text.includes('snapshot refresh error'))
+  assert.ok(!tree.text.includes('持久策略已保存'))
+  assert.ok(tree.text.includes('修订 rev-2'))
+  assert.equal(calls.filter((entry) => entry.endpoint === 'start').length, 1)
+})
+
+for (const fails of [false, true]) {
+  test('JSON draft retains original revision after policy refresh, failure=' + fails, async () => {
+    const bundle = loadBundle()
+    let changed = false
+    const { call, calls } = fakeCall({
+      'snapshot.fast': () => snapshotValue(),
+      'config.get': () => configValue(changed ? 'rev-2' : 'rev-1', changed),
+      start: () => {
+        changed = true
+        return fails
+          ? { ok: false, error: { code: 'OPERATION_FAILED', message: 'failed', details: { policyCommitted: true, autostart: true, configRevision: 'rev-2' } } }
+          : snapshotValue({ revision: 4, services: [service({ autostart: true })] })
+      },
+      'snapshot.full': () => snapshotValue({ revision: 4 }),
+      'config.set': () => ({ ok: false, error: { code: 'CONFIG_CONFLICT', message: 'stale draft', details: {} } }),
+    })
+    let tree = await mountAndSettle(bundle, call)
+    await clickAndSettle(tree, '高级：直接编辑 JSON')
+    tree = rerender(bundle, call)
+    const textarea = findByClass(tree.raw, 'svc-textarea')[0]
+    assert.equal(textarea.props.value, configValue('rev-1').raw, 'first open must load actual raw, not blank')
+    const draft = textarea.props.value + '\n'
+    textarea.props.onChange({ target: { value: draft } })
+    tree = rerender(bundle, call)
+    await clickAndSettle(tree, '启动并')
+    tree = rerender(bundle, call)
+    assert.equal(findByClass(tree.raw, 'svc-textarea')[0].props.value, draft)
+    assert.ok(tree.text.includes('JSON 草稿仍基于修订 rev-1；最新修订 rev-2'))
+    await clickAndSettle(tree, '保存 JSON')
+    const save = calls.find((entry) => entry.endpoint === 'config.set')
+    assert.equal(save.payload.expectedRevision, 'rev-1')
+    assert.equal(save.payload.raw, draft)
+    tree = rerender(bundle, call)
+    assert.ok(tree.text.includes('文件已被外部修改，请重新载入'))
+    assert.equal(findByClass(tree.raw, 'svc-textarea')[0].props.value, draft)
+    await clickAndSettle(tree, '重新载入')
+    tree = rerender(bundle, call)
+    assert.equal(findByClass(tree.raw, 'svc-textarea')[0].props.value, configValue('rev-2', true).raw)
+    await clickAndSettle(tree, '保存 JSON')
+    assert.equal(calls.filter((entry) => entry.endpoint === 'config.set').at(-1).payload.expectedRevision, 'rev-2')
+  })
+}
+
+test('open form keeps its revision when service policy changes underneath it', async () => {
+  const bundle = loadBundle()
+  let changed = false
+  const { call, calls } = fakeCall({
+    'snapshot.fast': () => snapshotValue(),
+    'config.get': () => configValue(changed ? 'rev-2' : 'rev-1', changed),
+    start: () => { changed = true; return snapshotValue({ revision: 4, services: [service({ autostart: true })] }) },
+    'config.upsert': () => ({ ok: false, error: { code: 'CONFIG_CONFLICT', message: 'stale form', details: {} } }),
+  })
+  await clickAndSettle(await mountAndSettle(bundle, call), '编辑配置')
+  await clickAndSettle(rerender(bundle, call), '启动并')
+  const tree = rerender(bundle, call)
+  assert.ok(tree.text.includes('修订 rev-2'))
+  await clickAndSettle(tree, '保存到配置文件')
+  const save = calls.find((entry) => entry.endpoint === 'config.upsert')
+  assert.equal(save.payload.expectedRevision, 'rev-1')
+  assert.equal(save.payload.service.autostart, false)
+  assert.ok(rerender(bundle, call).text.includes('stale form'))
 })

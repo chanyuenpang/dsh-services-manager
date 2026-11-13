@@ -15,3 +15,10 @@ node_modules/
 # 子代理/临时测量脚本（用完即删，绝不入库）
 .tmp-*/
 .tmp*/
+
+# Generated package archives and local credentials are not source.
+/dist/
+*.tgz
+*.log
+.env
+.env.local

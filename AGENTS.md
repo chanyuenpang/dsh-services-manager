@@ -2,6 +2,18 @@
 
 本文件记录本仓库对**所有 agent** 的硬性约束与已踩过的坑。改动代码前先读完它。
 
+## 当前版本补充（DSH 0.2.2-rc.1）
+
+下文旧命令示例保留作历史诊断；当前版本以这些事实为准，**先沙箱、后正式、不自动重启的门禁不变**：
+
+- 当前运行环境可能是 `desktop` profile，以 `DSH_PROFILE` / `DSH_PROFILE_DIR` 为准，不再固定是 `web`。
+- 新版服务为 `webStartup`（启动参数）和 `webApp`（已启动页面）；旧 `webRuntime` 注入不可复用。包内 patch 已给 `connection` 注入 `[webStartup, webServer]`，保留模板 trustedHosts 表达式依赖；不要再手改用户 profile 的 patch。
+- 正式安装使用 `plugin_manager install_bundle`，目标为已通过沙箱门禁的同一 tarball，不通过 CLI 绕过当前 profile 管理器。
+- PATH 无 `dsh` 时可通过 `scripts/current-dsh.mjs` 启动应用自带同版本 CLI，须显式提供 `DSH_TEST_EXECUTABLE` / `DSH_TEST_CLI`。Electron ASAR 运行时不能用普通 Node 直接加载。
+- 3099 被已有实例占用时先核实身份，不要杀未知实例；选择另一个空闲独立端口，四项门禁中的端口同步替换。本次使用 3109。
+- `job_kill` 不保证外层 CLI 的 Electron 子进程已退出；结束沙箱后必须确认端口释放。若有残留，只在核对沙箱命令行签名后按精确 PID 停止。
+- HTTP 门禁可用 `node scripts/verify-rpc-http.mjs --log <本次沙箱日志>`，不把 token 放 argv 或聊天；同时验证认证首页客户端清单。
+
 ## 硬性流程约束：必须先过沙箱，才允许挂载正式环境
 
 **任何"把本插件挂进正式环境"的动作，都必须在隔离沙箱里完成一次真实启动测试并通过之后才允许执行。**

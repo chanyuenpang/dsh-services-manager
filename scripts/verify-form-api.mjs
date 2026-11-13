@@ -39,7 +39,7 @@ async function waitPort(port, present, timeoutMs) {
 
 try {
   const initial = await invoke('config.get')
-  assert.equal(readServices().length, 2, '默认配置应有两条服务')
+  assert.equal(readServices().length, 0, '默认配置应为空')
   record('baseline', { revision: initial.revision, services: readServices().map((entry) => entry.id) })
 
   // 1) 表单新增：只提交一条定义，其余条目必须原样保留
@@ -61,7 +61,7 @@ try {
   assert.equal(added.id, created.id, '宿主必须回传生成的 id')
   assert.match(added.id, /^[a-z0-9._-]+$/, 'id 必须只含合法字符')
   assert.ok(added.id.startsWith('scratch'), 'id 应由名称派生（中文会被剥离，故这里是 scratch）')
-  assert.equal(afterCreate.length, 3, '新增不得丢掉原有条目')
+  assert.equal(afterCreate.length, 1, '新增应仅创建一条')
   record('config.upsert', { id: created.id, revision: created.revision, services: afterCreate.map((entry) => entry.id) })
 
   // 2) 过期 revision 必须被拒（表单同样受并发保护）
@@ -72,7 +72,7 @@ try {
     conflict = error
   }
   assert.equal(conflict?.code, 'CONFIG_CONFLICT', '过期 revision 必须返回 CONFIG_CONFLICT')
-  assert.equal(readServices().length, 3, '冲突时文件不得被改动')
+  assert.equal(readServices().length, 1, '冲突时文件不得被改动')
   record('config.conflict', { code: conflict.code, servicesUnchanged: readServices().length })
 
   // 3) 用表单建出来的服务必须真的能被启动/停止
@@ -85,20 +85,21 @@ try {
   record('start/stop', { port: scratchPort, ok: true })
 
   // 4) 表单编辑：改标题 + 关掉自动启动，其余字段保留
+  const currentRevision = (await invoke('config.get')).revision
   const edited = await invoke('config.upsert', {
-    expectedRevision: created.revision,
+    expectedRevision: currentRevision,
     service: { id: created.id, title: 'Scratch 改名后', port: scratchPort, command: `node "${path.join(here, 'scratch-server.mjs')}" ${scratchPort}`, cwd: here, autostart: false, autoStopOnExit: false, match: { commandLinePattern: 'scratch-server\\.mjs' } },
   })
   const afterEdit = readServices().find((entry) => entry.id === created.id)
   assert.equal(afterEdit.title, 'Scratch 改名后')
   assert.equal(afterEdit.autoStopOnExit, false)
-  assert.equal(readServices().length, 3, '编辑不得改变条目数量')
+  assert.equal(readServices().length, 1, '编辑不得改变条目数量')
   record('config.upsert.edit', { id: created.id, revision: edited.revision, autoStopOnExit: afterEdit.autoStopOnExit })
 
   // 5) 表单删除：条目消失，且不影响其它条目
   await invoke('config.remove', { id: created.id, expectedRevision: edited.revision })
   const afterRemove = readServices()
-  assert.equal(afterRemove.length, 2, '删除后应回到两条')
+  assert.equal(afterRemove.length, 0, '删除后应回到空配置')
   assert.ok(!afterRemove.some((entry) => entry.id === created.id), '被删条目必须消失')
   record('config.remove', { services: afterRemove.map((entry) => entry.id) })
 
@@ -127,7 +128,7 @@ try {
   assert.equal(derivedEntry.port, 4596, '端口必须从 --port 参数识别出来')
   assert.equal(derivedEntry.url, 'http://127.0.0.1:4596/', '识别到端口后应自动推导 url')
   await invoke('config.remove', { id: derived.id, expectedRevision: derived.revision })
-  assert.equal(readServices().length, 2, '收尾后配置应回到两条')
+  assert.equal(readServices().length, 0, '收尾后配置应回到空配置')
   record('port.derived', { id: derived.id, port: derivedEntry.port, url: derivedEntry.url })
 
   console.log('PASS')

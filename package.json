@@ -1,27 +1,33 @@
 {
   "name": "dsh-services-manager",
-  "version": "0.1.0",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
-  "description": "DSH 设置页的「服务管理」分区：查看/启动/停止/重启/刷新宿主后台网络服务，并支持一键重启 dsh 自身。",
+  "description": "DSH 0.2 Desktop/Web 的服务管理分区：查看与控制宿主后台服务，并按运行时安全重启当前 DSH。",
   "keywords": ["dsh", "deepseek-harness", "cordis-plugin", "services"],
   "license": "MIT",
   "main": "src/index.mjs",
+  "bin": { "dsh-services": "src/cli.mjs" },
   "exports": {
     ".": "./src/index.mjs",
     "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
   "files": [
     "src/",
     "lib/",
     "docs/",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "locale/*.json",
+    "icon.svg"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=20",
+    "dsh": ">=0.2.2-rc.1"
   },
   "dsh": {
     "bundle": {
@@ -35,10 +41,11 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1"
+    "@deepseek-ai/cordis": "^4.1.0"
   },
   "scripts": {
     "test": "node --test \"test/**/*.test.mjs\"",
-    "verify-host": "node scripts/verify-host.mjs"
+    "verify-host": "node scripts/verify-host.mjs",
+    "verify-cli-package": "node scripts/verify-cli-package.mjs"
   }
 }

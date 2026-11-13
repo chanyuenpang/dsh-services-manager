@@ -53,7 +53,7 @@ test('readConfig 在缺失时写入默认配置并给出内容指纹', () => {
   const configPath = tempConfigPath()
   const config = readConfig(configPath)
   assert.equal(fs.existsSync(configPath), true)
-  assert.equal(config.services.length, 2)
+  assert.equal(config.services.length, 0)
   assert.equal(config.issues.length, 0)
   assert.equal(config.revision, revisionOf(config.raw))
 })
