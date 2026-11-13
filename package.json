@@ -6,6 +6,9 @@
   "description": "DSH 0.2 Desktop/Web 的服务管理分区：查看与控制宿主后台服务，并按运行时安全重启当前 DSH。",
   "keywords": ["dsh", "deepseek-harness", "cordis-plugin", "services"],
   "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/chanyuenpang/dsh-services-manager.git" },
+  "homepage": "https://github.com/chanyuenpang/dsh-services-manager#readme",
+  "bugs": { "url": "https://github.com/chanyuenpang/dsh-services-manager/issues" },
   "main": "src/index.mjs",
   "bin": { "dsh-services": "src/cli.mjs" },
   "exports": {
@@ -22,6 +25,7 @@
     "docs/",
     "cordis.patch.yml",
     "README.md",
+    "LICENSE",
     "locale/*.json",
     "icon.svg"
   ],

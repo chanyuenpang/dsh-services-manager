@@ -13,6 +13,28 @@
 
 ## 安装
 
+### 公开分发（无需克隆源码）
+
+适配基线为 DSH Desktop/Web **0.2.2-rc.1**。公开安装包包含宿主、界面和 CLI，不需要安装期构建脚本。
+
+在 DSH Desktop 的插件管理器中选择「安装」，输入此预构建包地址：
+
+```text
+https://github.com/chanyuenpang/dsh-services-manager/releases/download/v0.2.2/dsh-services-manager-0.2.2.tgz
+```
+
+普通 Web profile 可使用：
+
+```powershell
+dsh plugin --profile web add https://github.com/chanyuenpang/dsh-services-manager/releases/download/v0.2.2/dsh-services-manager-0.2.2.tgz
+```
+
+插件市场条目正在提交；收录后可直接搜索 `dsh-services-manager`。是否需要重启以插件管理器的安装结果为准；安装不授权自动重启。
+
+首次安装不会导入作者的服务列表。所有路径、命令和自动启动策略都由使用者自己登记。插件能启动和停止宿主进程；「重启 DSH」必须单独明确确认，请只登记可信命令。
+
+### 本地包与开发验证
+
 ```powershell
 # 1) 先在隔离沙箱验证，再安装目标 profile；路径换成你持有的离线包
 # DSH 0.2 Desktop
@@ -53,7 +75,7 @@ npm install --offline --ignore-scripts --legacy-peer-deps --no-audit --no-fund C
 
 register/remove 先读当前 revision，由宿主在同步提交内以 expectedRevision 原子保存（单宿主写者，不是跨进程事务）。冲突退出 5：`get` 读回、核对后以 `--revision 新值` 重提相同 id，不盲重试。坏条目拒绝修改，不丢弃。启停执行失败可能已经保存策略，应看 error.details.policyCommitted/autostart/configRevision；断线后先 get/list。CLI 不直接改配置、不启动第二个 manager、不提供宿主重启入口。
 
-`private:true` 保留，交付方式是本地 `npm pack` tarball，不发布 registry。`npm run verify-cli-package` 从全新含空格目录离线安装包，并从非仓库 cwd 验证直接入口与 .bin；隔离 HTTP 客户端测试不等于真实 DSH 沙箱上线门禁（另见安装文档）。
+`private:true` 保留以避免误发 npm；公开交付使用 GitHub Release 的预构建 `npm pack` tarball，插件市场可直接指向该包。`npm run verify-cli-package` 从全新含空格目录离线安装包，并从非仓库 cwd 验证直接入口与 .bin；隔离 HTTP 客户端测试不等于真实 DSH 沙箱上线门禁（另见安装文档）。
 
 ## 配置
 
