@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Services manager",
-    "description": "Inspect background services, manage persistent start policies and service configuration, and safely restart the current DSH."
+    "description": "Open running web services from the right sidebar in DSH or your system browser. Manage background services, persistent start policies and configuration in Settings, and safely restart the current DSH."
   }
 }

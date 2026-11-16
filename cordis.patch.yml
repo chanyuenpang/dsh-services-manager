@@ -7,3 +7,5 @@
 - insert:
     - id: dsh-services-manager
       name: dsh-services-manager
+    - id: dsh-services-manager-skills
+      name: dsh-services-manager/skills

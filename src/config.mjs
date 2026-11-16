@@ -133,8 +133,12 @@ export function parseConfig(raw) {
   return { services, issues }
 }
 
-/** 读取配置；文件不存在则写入默认配置。 */
-export function readConfig(configPath) {
+/** 读取配置；只读调用可选择虚拟空配置，绝不隐式落盘。 */
+export function readConfig(configPath, { create = true } = {}) {
+  if (!create && !fs.existsSync(configPath)) {
+    const raw = `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`
+    return { raw, revision: revisionOf(raw), services: [], issues: [] }
+  }
   if (!fs.existsSync(configPath)) {
     fs.mkdirSync(path.dirname(configPath), { recursive: true })
     fs.writeFileSync(configPath, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`, 'utf8')
@@ -176,7 +180,7 @@ export function readConfigRaw(configPath) {
  * @throws {Error & {code:string, details?:object}} CONFIG_CONFLICT / CONFIG_INVALID
  */
 export function saveConfig(configPath, raw, expectedRevision, { preserveFields = false } = {}) {
-  const current = readConfig(configPath)
+  const current = readConfig(configPath, { create: false })
   if (typeof expectedRevision === 'string' && expectedRevision !== '' && expectedRevision !== current.revision) {
     const error = new Error('配置文件已被外部修改，请重新载入后再保存。')
     error.code = 'CONFIG_CONFLICT'

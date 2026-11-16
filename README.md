@@ -20,13 +20,13 @@
 在 DSH Desktop 的插件管理器中选择「安装」，输入此预构建包地址：
 
 ```text
-https://github.com/chanyuenpang/dsh-services-manager/releases/download/v0.2.2/dsh-services-manager-0.2.2.tgz
+https://github.com/chanyuenpang/dsh-services-manager/releases/download/v0.2.6/dsh-services-manager-0.2.6.tgz
 ```
 
 普通 Web profile 可使用：
 
 ```powershell
-dsh plugin --profile web add https://github.com/chanyuenpang/dsh-services-manager/releases/download/v0.2.2/dsh-services-manager-0.2.2.tgz
+dsh plugin --profile web add https://github.com/chanyuenpang/dsh-services-manager/releases/download/v0.2.6/dsh-services-manager-0.2.6.tgz
 ```
 
 插件市场条目正在提交；收录后可直接搜索 `dsh-services-manager`。是否需要重启以插件管理器的安装结果为准；安装不授权自动重启。
@@ -57,7 +57,35 @@ GUI 中通过插件管理器安装本地包；安装结果决定是否即时生�
 
 回滚见 [`docs/安装与回滚.md`](docs/安装与回滚.md)。
 
-## 无源码 CLI（agent 的主要自足入口）
+## 右侧网页服务（0.2.6）
+
+右侧栏 **＋ → 网页服务** 打开极简启动台，只列出运行中、有 HTTP(S) 地址的已登记服务（不列 DSH 本体）。每行只显示服务名称及两个图标：分栏窗口图标在 DSH 内置浏览器中打开，外链箭头直接在系统默认浏览器中打开；hover 显示说明，键盘焦点也有无障碍名称。不显示端口、状态、启停或配置按钮；管理操作仍在 **设置 → 服务管理**。
+
+停止的服务自动隐藏，运行后自动出现；只有启动台可见且页面在前台时才读取快照。打开网页不会启动服务或修改 autostart。内置浏览器未启用时，相应图标禁用，可使用外链箭头；Web 版外链在当前浏览器的新标签页打开，Desktop 则沿用 DSH 的系统浏览器打开策略。网址仅接受 HTTP(S)，拒绝内嵌凭据及当前 DSH 应用同源网址。界面跟随明暗主题，读取失败显示图标重试，不将旧列表伪装成新鲜状态。
+
+## Agent 一站式原生接入（0.2.4）
+
+桌面 DSH 内调用 /services-manager：agent 自动发现产物、登记并确保运行，再交付 URL，不需要 token、浏览器认证或用户手动启停。Web 产物使用项目入口；静态 HTML/构建目录可用插件自带的 src/static-server.mjs，无额外依赖。
+
+- 原生 services_manager：list/get 读取定义与 configRevision；attach(service,expectedRevision) 单服务排队登记并启用 autostart、启动和验证；status(id) 提供新鲜的监听身份与健康证据。显式只登记仍使用 register（不启动）。
+- start/stop(id,expectedRevision) 持久化 autostart true/false；restart 保持原策略。复用同一 Host manager 与托管 subprocess，不另起 manager，不开放删除/日志/任意 RPC/DSH 重启。
+- read-only 只读；workspace-write 每次变更需要宿主批准；danger-full-access 可直接按用户意图执行。批准后和每个异步副作用边界重查权限、取消、配置修订与真实 cwd。
+- 稳定 id、真实绝对 cwd、固定端口、专用入口签名；同 id patch 保留其他服务/未知扩展/env。相对 Node 脚本只有经真实进程 cwd 核实后规范成同一绝对入口才通过原签名，不放宽签名、不漂移端口、不强杀未知进程。
+- status 不把“别人的端口有响应”当成目标 running；配置 probe 时 attach 必须健康。返回与错误均不回显命令、签名、env、token 或 Host argv。
+- 配置成功和进程成功不是原子事务。错误保留 policyCommitted、registered、configRevision、phase 等安全证据；失败/取消/冲突后先 get/status，不能盲回滚或重放 restart。
+- 默认挂载=登记并运行、随 DSH 恢复；显式只登记=register、默认不自启。技能完整合同位于 [services-manager](skills/services-manager/SKILL.md)。
+
+### 随包技能（0.2.5）
+
+插件包包含完整的 `skills/services-manager/`（正文、离线发现脚本、外部 CLI 参考）。安装并启用插件后，独立的 `dsh-services-manager-skills` 条目向 DSH 原生 skills 注册表注册同名技能；Agent 可直接加载 `services-manager`，无需另装技能或克隆开发仓库。
+
+- 技能资源基址指向实际安装包内目录，随插件升级更新；注册不写入用户的全局技能目录。
+- 禁用/卸载技能条目或整个插件会撤销包内注册，不删除用户自有文件。DSH 的作用域与同名优先级仍适用：较近的预设作用域可遮住 Host 注册；同层项目技能优先于运行时技能，运行时技能优先于用户技能。已有本地同名副本可能继续胜出；需要迁移时经用户授权同步覆盖或移除，不由插件擅自改写全局文件。
+- 升级后需实际加载技能并回读 `services_manager.list` 的 capabilities；`applied` 或包版本变化本身不是 Host 已生效的证据。不自动重启 DSH。
+- 技能注册为独立入口，不创建第二个 manager，也不启动或停止服务；缺少 `skills` 服务时，技能条目不能加载，服务管理核心保持独立。
+
+
+## 无源码 CLI（外部客户端兼容入口）
 
 包内自带 `dsh-services`，不注入 skill、不需要开发仓库。完整合同在 **`--help`**，离线也可读；帮助会打印已解析的安装位置：
 
@@ -199,7 +227,7 @@ pwsh -File scripts/preview-sandbox.ps1 -Stop  # 看完停掉
 
 ## 架构（三句话）
 
-- 宿主半边 `src/index.mjs` 提供 `ctx.subprocess` + `connection` 依赖，注册一条 RPC 通道 `/dsh-services`。
+- 宿主半边 `src/index.mjs` 提供 `ctx.subprocess` + `connection` 依赖，注册 RPC `/dsh-services` 和 profile 级原生工具 `services_manager`，共享一个 manager；原生工具独立使用会话权限，不经 HTTP/token。
 - 浏览器半边 `lib/client.js` 是手写的 `window.__ModuleLoader__.load({...})` 单文件 bundle，注册 `settings.section`，只通过 `ctx.connection.rpc.call` 与宿主通信。
 - 监管核心 `src/supervisor.mjs`：活性以端口为准，所有权分 `spawned` / `discovered`，终止外部进程前必须通过命令行签名校验。
 

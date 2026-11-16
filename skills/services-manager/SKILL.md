@@ -1,64 +1,52 @@
 ---
 name: services-manager
-description: 将当前项目或其他项目的 Web 服务挂载、接入、登记到 DSH services manager（服务管理器），或更新已登记服务的启动命令、端口与自动启动策略。使用已安装插件的 dsh-services CLI，保留现有服务；默认只登记，不擅自启动或重启 DSH。
+description: 将本机任意可运行的 Web 产物或静态页面一站式挂到桌面端 DSH：自动识别真实入口、登记、启动、验证并给出 URL。优先使用 services_manager 原生工具，无需 token、浏览器认证或用户手动启停；保留既有服务和固定端口。
 ---
 
-# 接入服务管理器
+# 一站式挂到 DSH
 
-目标：让项目的 Web 服务出现在 **设置 → 服务管理**，由现有插件统一观测和启停。这里的“挂载”是登记服务定义，不是安装第二个 manager，也不是向 DSH 加一个插件。
+用户调用本技能或要求“挂载/接入产物”时，默认目标是**已登记并运行可访问**，不是只写一条配置。由 agent 完成入口发现、配置、启动和验收，用户无需找 token、开认证页面、手动停进程或填 JSON。显式“只登记/不启动”才停在登记阶段。
 
-## 先守住边界
+## 桌面原生路线（默认且唯一）
 
-- 默认只登记：新服务 `autostart:false`、`autoStopOnExit:true`。只有用户要求时才立即启动或设为随 DSH 自动启动；修改已有条目时保留未要求改变的策略。
-- **所有日常写操作走已安装 CLI → 正在运行的宿主 RPC**，不直接编辑/替换 `services.json`，不借用旧默认配置覆盖整份列表。已有服务不得丢失。
-- 不重启 DSH，不调用宿主重启端点，不执行 restart-supervisor。登记和刷新列表不需要重启。
-- 端口被占用不代表可以接管。终止/重启前必须验证实际监听者的命令行签名；不放宽签名、不用 `force`、不杀未知进程。
-- 认证缺失就停在已准备的定义：不扫描其他 profile、日志、凭据库或浏览器 cookie 寻找 token。token 不进入命令参数、聊天、服务 JSON、仓库或共享日志。
+1. 依据当前 DSH_PROFILE / DSH_PROFILE_DIR 确认本次宿主，不把桌面 DSH 当外部 Web 客户端。不另起 DSH、第二个 manager 或绕过现有管理器直接 shell 启停。
+2. 原生 services_manager 的 action:list / get 取得既有 ids 和 configRevision。list 返回 capabilities；确认包含 attach/status。工具旧版或缺失是插件加载/版本/会话工具策略缺口，**不是用户缺 token**。不要切到浏览器或 token CLI，不索取或扫描凭据。
+3. 检查产物目录、说明、构建结果和真实服务入口。自动准备一条 service：稳定 id、实际绝对 cwd、可持续运行的 command、固定 port/url 和可靠 match.commandLinePattern。跨项目允许；同 id patch，绝不生成 -2 或覆盖整份服务清单。
+4. 告知本次默认“挂载并启用随 DSH 启动”，然后 action:attach + service + 最新 expectedRevision。attach 在同一 manager 内单服务排队完成登记、autostart:true、启动与身份/健康验证；已验证运行实例只确认，不为了 ownership 重启。
+5. action:status,id 回读新鲜运行态；必要时 get/list 确认其他服务未丢失。成功要求 status=running、identityVerified=true；配置 probe 时 healthy 必须 true。仅有 registered、autostart:true 或 PID 不算完成。
+6. 只交付服务名、可访问 URL、已运行与自启动策略。不要让用户再去面板点击启动或“全部刷新”才能完成。
 
-## 按顺序操作
+原生 action:register 保持只登记、不启动的语义，适用于用户明确只登记；新条目默认 autostart:false。action:start/stop(id,expectedRevision) 分别持久化 true/false，restart 保持原策略；均不重启 DSH。明确一次性运行不自启时：attach 成功后，用最新 revision register autostart:false 并 status 验证，不能用 stop 代替取消自启。
 
-### 1. 找到当前插件和目标宿主
+## 产物与入口的真实定义
 
-运行本 skill 随附的离线发现脚本：
+- 动态服务：读项目自己的脚本/入口，用绝对脚本路径与项目支持的 strict-port，不让开发服务器自动漂移。依赖缺失时由 agent 判断并按任务授权准备，不能将未经验证的安装命令冒充服务启动命令。
+- 静态 HTML/前端构建产物：无需用户安装静态服务。运行本技能的离线发现脚本（只检查当前 profile）取得 staticServer 和 nodeExecutable：
 
-```powershell
-node "<本 skill 目录>/scripts/resolve-cli.mjs"
-```
+  `node "<本技能目录>/scripts/resolve-cli.mjs"`
 
-它只检查当前 `DSH_PROFILE_DIR`（或明确的 `DSH_HOME` + `DSH_PROFILE`），返回 `cli` 绝对路径和不含 token 的 `origin`。非 DSH 环境可显式传 `--profile-dir <用户指定的 profile 绝对路径>`；不猜 `web`/`desktop`，不扫描其他 profile。
+  确认 staticServer 已存在，用插件自带入口："<nodeExecutable>" "<staticServer>" --root "<绝对产物目录>" --port <固定端口> [--entry <目录内首页文件>]。默认首页 index.html；单页报告可指定其文件名。优先 dist/build 等产物目录，不把含凭据的项目根目录作为公共目录。该入口只监听127.0.0.1、不列目录、不接受越界路径，端口占用就失败，不改端口。
+- 签名应锁定实际监听者的专用绝对入口和完整端口边界；静态服务还须包含专用 --root。不能使用裸 node/npm/vite/.*。Node 的相对脚本只有在宿主核实**真实进程工作目录**并规范到相同绝对入口后才可通过原有签名；不会降低签名标准。
+- Windows 路径带空格需正确引号。命令禁止 shell 管道/连接符/重定向，多步用项目自有入口。工具参数会进入会话日志，不传 env、token 或凭据；已有 env 原样保留。
+- 沿用已注册固定端口，不为绕开冲突改端口。新产物尚无端口时 agent 自行挑选并验证空闲端口后固定登记。默认 loopback，不擅自开放到局域网。
+- probe 只配项目已知健康路径与预期状态；未知则不虚构。
 
-运行 `node "<cli>" --help`，**以已安装版本帮助为准**。插件不存在或宿主未启动时说明缺项，不自动安装、升级或另起宿主。目标 origin 优先用用户明确选择的 `DSH_SERVICES_URL`，否则可用当前运行时 `DSH_WEB_URL` 的 origin；不能硬编码端口。有多个宿主时问用户选哪一个。
+## 权限、冲突与失败
 
-读 [CLI 操作参考](references/cli.md) 获得完整 PowerShell 示例、认证输入方式、JSON 字段和错误恢复。
+- read-only 拒绝任何变更；workspace-write 必须使用宿主本次调用批准；danger-full-access 按用户意图执行。禁用/拒绝审批时不改会话权限、不切 shell/HTTP 绕过。无额外操作指不要求手工配置/认证，不代表取消宿主权限门禁。
+- 配置唯一来源是 manager 的服务文件，只通过原生工具单条提交，不直接编辑、不覆盖其他服务、不保存运行态到配置。
+- PORT_OWNED_BY_OTHER：不让端口、不强杀未知进程、不用 force、不放宽签名。自行只读核实具体监听PID、实际cwd/入口；来源不明时明确具体阻塞，而不是要求用户找token或手动处理。
+- 错误可能在配置/策略提交后发生。检查 error.details 的 registered、policyCommitted、configRevision、phase、runtimeMayHaveChanged，报告实际阶段，不假称完成，不盲回滚。
+- CONFIG_CONFLICT：重新 get/list/status，审阅变化后重提；丢响应/取消/超时先读回，restart 尤其不得盲重放。
+- 端口与身份失败就是失败；健康失败不算挂载完成，不将任意200页面当作目标产物。
+- 不自动重启 DSH、不执行 restart-supervisor、不更改用户 profile patch。
 
-### 2. 从目标项目获取真实定义
+## 插件升级后的验收
 
-先读项目说明、包管理器脚本和服务入口，确认：
+插件管理器返回 `applied` 或磁盘版本更新，不等于当前 Host 已加载新能力。升级后必须调用 services_manager 的 list，核对 capabilities 包含 attach、status、start、stop、restart，再用 status 回读目标服务的身份与健康状态。若仍暴露旧工具，只报告“已安装、当前 Host 尚未确认生效”；不自动重启 DSH，不用 CLI/token 路线绕过。
 
-- **稳定 id**：如 `project-name-web`；同一项目多项服务用不同明确后缀。先 `get`/`list` 检查同名 id；存在则更新同一条，不自动生成 `-2`。`dsh` 是保留 id。
-- **command / cwd**：可在后台持续运行的真实命令，以及宿主上存在的绝对目录。依赖应已就绪；缺依赖时先报告，不把未经验证的安装命令冒充启动命令。Windows 路径含空格要在 command 内正确加引号；不塞 `&&`、管道或重定向，多步逻辑用项目自有脚本。
-- **固定 port / url**：不能留给 Vite 等工具悄悄漂移；使用项目支持的固定端口和 strict-port 选项，默认绑定 `127.0.0.1`，非本机公开监听需用户明确要求。
-- **match.commandLinePattern**：可编译的非空正则，能锁定实际监听进程。优先“项目绝对路径/专用入口 + 端口”；不要用裸 `node`、`vite`、`npm`、`.*`，也不要误以为监听子进程一定包含 npm 父进程命令。无法建立可靠签名就先澄清，不能假造安全证据。
-- 可选健康检查：只用项目已知的路径和预期状态码；不知道则省略，不拿任意 200 页面冒充健康。
+本技能由插件包注册，scripts 与 references 均以本次加载返回的资源目录为准，不依赖作者的开发仓库或全局技能副本。
 
-若项目未运行且仅要求登记，可依据入口准备签名并注明“尚未实测监听者”；不要为验证而擅自启动。若用户同时要求启动，再在启动后核验真实 PID/命令行。
+## 外部客户端（仅用户明确指定）
 
-### 3. 认证、读现状、登记
-
-1. 使用用户已通过受保护环境变量或 stdin 提供的 token；只问缺失的用户选择，不要求把 token 发进聊天。
-2. `get` 读取完整定义和 revision，`list` 查看运行态；记录现有 ids 和待更新条目的原值，不将原始敏感配置输出到聊天。
-3. 准备**单条**服务 JSON。新建需明确 id、command、cwd、整数 port、非空签名；已有条目只提交要改的字段，保留其他字段和策略。
-4. 用 `register --file <单条 JSON> --revision <刚审阅的 revision>` 提交。`register` 不会启动进程；`autostart:true` 也只表示后续插件加载时恢复。
-5. `get` + `list` 回读：同一 id 只有一条，字段和策略正确，原有 ids 没有消失。网络断开/超时后先回读，不盲目重放写操作。
-
-`CONFIG_CONFLICT` / 退出 5：重新 `get`，核对差异，再按用户意图用新 revision 提交；不循环强制覆盖。配置有无效条目则保留原文并报告，不能丢弃坏条目以“修好登记”。
-
-### 4. 仅按授权启动与验收
-
-- 用户只说“挂载/登记”：到登记回读完成为止，报告“已登记，未启动”。
-- 用户要求“随 DSH 启动”：登记 `autostart:true`；若没要求立即启动，说明本次没有启动。
-- 用户要求“现在启动”：执行 `start <id>`，它会先持久化 `autostart:true`。先告知这一持久影响；若用户明确要“一次性启动但不自启”，启动成功后用最新 revision 登记 `autostart:false` 并回读，而不是用 stop 关掉运行实例。
-- 已有外部实例：先核实签名和端口，不为了获得 spawned 所有权而停止/重启它。未通过签名验证不声明为已安全接管。
-- 真正“启动成功”需目标端口 LISTENING、身份匹配；配置了 probe 时还要核验预期状态。仅有进程句柄、`autostart:true` 或登记成功不是运行证据。
-
-交付只报告：服务 id、项目/命令摘要、URL、自动启动策略、已登记/已运行/待验证、验证证据或阻塞；入口为 **设置 → 服务管理 → 全部刷新**。不得把“登记成功”说成“服务已启动”。
+才使用已安装 CLI 与用户已有私密认证来源。参见 [外部CLI合同](references/cli.md)。桌面内原生接入不走该路线；凭据缺失不扫描日志/profile/cookie，也不让用户把 token 发进聊天。

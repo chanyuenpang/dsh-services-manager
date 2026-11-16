@@ -13,6 +13,7 @@ test('current Host contract declares route dependencies and awaits async dispose
   let rpcDisposed = false
   const ctx = {
     subprocess: { spawn() { throw new Error('empty config must not spawn') } },
+    inject(names) { assert.deepEqual(names, ['tools', 'sandboxPolicy']) }, // optional capabilities absent
     effect(fn) { const dispose = fn(); disposers.push(dispose); return dispose },
     get(key) {
       assert.equal(key, 'connection')

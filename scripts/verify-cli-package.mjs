@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import assert from 'node:assert/strict'
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm package offline '))
@@ -27,10 +27,20 @@ try {
   run(npm, ['install', '--offline', '--ignore-scripts', '--legacy-peer-deps', '--no-audit', '--no-fund', quoted(path.join(temp, tarballs[0]))], installed)
   const entry = path.join(installed, 'node_modules', 'dsh-services-manager', 'src', 'cli.mjs')
   assert.ok(fs.existsSync(entry))
+  const packageDir = path.dirname(path.dirname(entry))
+  const { loadPackagedSkill } = await import(pathToFileURL(path.join(packageDir, 'src', 'skill-plugin.mjs')))
+  const skill = loadPackagedSkill()
+  assert.equal(path.resolve(skill.resourceBase.path), path.join(packageDir, 'skills', 'services-manager'))
+  for (const resource of ['SKILL.md', 'scripts/resolve-cli.mjs', 'references/cli.md']) {
+    assert.ok(fs.statSync(path.join(skill.resourceBase.path, resource)).isFile(), 'packed skill resource: ' + resource)
+  }
+  assert.match(skill.content, /插件升级后的验收/)
+  assert.ok(fs.existsSync(path.join(packageDir, 'locale', 'skills', 'zh.json')))
   const env = { ...process.env }
   delete env.DSH_SERVICES_URL; delete env.DSH_SERVICES_TOKEN
   // Neither call references the repository; no credentials/network required for --help.
   run(quoted(process.execPath), [quoted(entry), '--help'], unrelated, env)
+  run(quoted(process.execPath), [quoted(path.join(skill.resourceBase.path, 'scripts', 'resolve-cli.mjs')), '--profile-dir', quoted(installed)], unrelated, { ...env, DSH_WEB_URL: '', DSH_SERVICES_URL: '' })
   const bin = path.join(installed, 'node_modules', '.bin', process.platform === 'win32' ? 'dsh-services.cmd' : 'dsh-services')
   assert.ok(fs.existsSync(bin))
   run(quoted(bin), ['--help'], unrelated, env)

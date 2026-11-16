@@ -93,3 +93,12 @@ test('documented registration JSON validates and signature distinguishes project
   assert.equal(pattern.test('node "C:/Projects/other/server.mjs" --port 4590'), false)
   assert.equal(pattern.test('node "C:/Projects/example-web/server.mjs" --port 45901'), false)
 })
+
+test('skill defaults to native attach and verification, never delegates desktop authentication to user', () => {
+  const text=fs.readFileSync(path.join(skillDir,'SKILL.md'),'utf8')
+  assert.match(text,/默认目标是.*已登记并运行可访问/)
+  assert.match(text,/action:attach/);assert.match(text,/identityVerified=true/)
+  assert.match(text,/不要切到浏览器或 token CLI/)
+  assert.match(text,/不为绕开冲突改端口/)
+  assert.ok(fs.existsSync(fileURLToPath(new URL('../src/static-server.mjs',import.meta.url))))
+})

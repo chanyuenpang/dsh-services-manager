@@ -17,6 +17,7 @@ export function createFakeSeam({ configPath, stateDir, logDir }) {
   }
 
   const ctx = {
+    inject() {}, // This seam verifies legacy RPC only; native executor has a separate gate.
     config: { configPath, stateDir, logDir },
     effect(fn) {
       const disposer = fn()

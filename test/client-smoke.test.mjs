@@ -150,6 +150,7 @@ async function mountAndSettle(bundle, call) {
 function registeredComponent(plugin) {
   let component = null
   plugin.apply({
+    inject: () => () => {}, // Optional launcher scope is covered separately.
     connection: { rpc: { call: async () => ({ ok: true, value: {} }) } },
     slots: {
       inject: (name, register) => register(),

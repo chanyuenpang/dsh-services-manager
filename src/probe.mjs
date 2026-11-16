@@ -14,6 +14,7 @@
 import { execFile } from 'node:child_process'
 import net from 'node:net'
 import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
 
 const run = promisify(execFile)
 
@@ -177,6 +178,16 @@ export function matchesSignature(commandLine, pattern) {
   } catch {
     return false
   }
+}
+
+/** Read-only x64 Windows PEB query, only used when a relative Node script needs disambiguation. */
+export async function processDirectory(pid) {
+  if (process.platform !== 'win32' || !Number.isInteger(pid) || pid <= 0) return null
+  try {
+    const { stdout } = await run('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fileURLToPath(new URL('./process-directory.ps1', import.meta.url)), '-TargetProcessId', String(pid)], {encoding:'utf8',windowsHide:true,timeout:15000,maxBuffer:1024*1024})
+    const result=JSON.parse(stdout.trim())
+    return result?.pid===pid && typeof result.cwd==='string' && typeof result.commandLine==='string' ? result : null
+  } catch {return null}
 }
 
 /** 进程是否仍存在（信号 0 只做存在性探测，不真的发信号）。 */

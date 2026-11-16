@@ -52,7 +52,7 @@ export function resolveCli({ env = process.env, profileDir } = {}) {
     }
     origin = url.origin
   }
-  return { ok: true, profileDir: directory, cli, version: manifest.version, origin, helpArgv: ['node', cli, '--help'] }
+  return { ok: true, profileDir: directory, cli, staticServer: path.join(packageDir, 'src', 'static-server.mjs'), nodeExecutable: process.execPath, version: manifest.version, origin, helpArgv: ['node', cli, '--help'] }
 }
 
 export function main(argv = process.argv.slice(2), env = process.env) {

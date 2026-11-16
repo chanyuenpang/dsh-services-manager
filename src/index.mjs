@@ -9,6 +9,7 @@
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createManager } from './supervisor.mjs'
+import { registerAgentTool } from './agent-tool.mjs'
 import { defaultConfigPath, defaultLogDir, defaultStateDir } from './config.mjs'
 
 export const name = 'dsh-services-manager'
@@ -75,6 +76,8 @@ export function apply(ctx, config) {
       if (typeof dispose === 'function') return dispose()
     }
   })
+
+  registerAgentTool(ctx, manager)
 
   // 启动证据：宿主日志里必须能看到这一行，否则沙箱/正式环境的挂载都不算成功。
   // 同时 fail-loud 地确认 subprocess 真被注入：缺注入时这里立刻抛，而不是等第一次启动服务才炸。

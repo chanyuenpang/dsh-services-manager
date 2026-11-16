@@ -11,7 +11,9 @@
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import path from 'node:path'
+import fs from 'node:fs'
 import { launchArgv } from './command.mjs'
+import { canonicalNodeCommand } from './identity.mjs'
 import * as probe from './probe.mjs'
 import { readConfig, saveConfig, setAutostart, parseConfig } from './config.mjs'
 import { mergeRegistration } from './registration.mjs'
@@ -65,7 +67,7 @@ function fail(code, message, details) {
  */
 export function createManager({ ctx, configPath, stateDir, logDir, supervisorScript, io = {} }) {
   // 默认是真实平台 I/O；测试可精确控制异步边界，不启动或终止宿主进程。
-  const { commandLines, killTree, listListeners, matchesSignature, tcpProbe } = { ...probe, ...io }
+  const { commandLines, killTree, listListeners, matchesSignature, tcpProbe, httpProbe, processDirectory } = { ...probe, ...io }
   const controlList = io.listListeners ?? controlListeners
   const waitForPortFree = io.waitForPortFree ?? ((port, options) => waitForControlPort(port, false, options))
   const waitForPortListening = io.waitForPortListening ?? ((port, options) => waitForControlPort(port, true, options))
@@ -385,26 +387,37 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     return definitions().list.some((entry) => entry.id === id && entry.autostart === true)
   }
 
-  async function waitForControlPort(port, present, { timeoutMs }) {
+  async function waitForControlPort(port, present, { timeoutMs, check = assertActive }) {
     const deadline = Date.now() + timeoutMs
     for (;;) {
-      assertActive()
+      check()
       const listeners = await controlList()
-      assertActive()
+      check()
       if (listeners.has(port) === present) return true
       if (Date.now() >= deadline) return false
       await new Promise((resolve) => setTimeout(resolve, 250))
     }
   }
 
-  async function listenerIdentity(definition) {
+  async function listenerIdentity(definition, check = assertActive) {
+    check()
     const pid = (await controlList()).get(definition.port)
-    assertActive()
+    check()
     if (pid === undefined) return null
     if (pid === process.pid) throw fail('OPERATION_FAILED', '普通服务操作不能控制 DSH 宿主进程。', { port: definition.port, pid })
     const commandLine = (await commandLines([pid], { fresh: true })).get(pid) ?? ''
-    assertActive()
-    if (!matchesSignature(commandLine, definition.match?.commandLinePattern)) {
+    check()
+    let identityMatches = matchesSignature(commandLine, definition.match?.commandLinePattern)
+    if (!identityMatches && canonicalNodeCommand(commandLine, definition.cwd, definition.cwd) !== null) {
+      // Relative argv alone is ambiguous. Require the real physical cwd and a stable process identity.
+      const identity = await processDirectory(pid)
+      check()
+      if (identity?.commandLine === commandLine) {
+        const canonical = canonicalNodeCommand(commandLine, identity.cwd, definition.cwd)
+        identityMatches = canonical !== null && matchesSignature(canonical, definition.match?.commandLinePattern)
+      }
+    }
+    if (!identityMatches) {
       throw fail('PORT_OWNED_BY_OTHER', '端口 ' + definition.port + ' 的监听者身份不匹配，已拒绝控制。',
         { port: definition.port, pid, commandLine, pattern: definition.match?.commandLinePattern ?? '' })
     }
@@ -412,14 +425,14 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     if ((await controlList()).get(definition.port) !== pid) {
       throw fail('PORT_OWNED_BY_OTHER', '端口监听者在身份校验期间发生变化，请刷新后重试。', { port: definition.port, pid })
     }
-    assertActive()
+    check()
     return pid
   }
 
   /** 内部执行不入队、不改策略；调用者持有该服务的完整事务队列。 */
-  async function startInternal(definition, { restoring = false } = {}) {
+  async function startInternal(definition, { restoring = false, check = assertActive } = {}) {
     const id = definition.id
-    const allowed = () => { assertActive(); return !restoring || restoreAllowed(id) }
+    const allowed = () => { check(); return !restoring || restoreAllowed(id) }
     if (!allowed()) return 'skipped'
     const instance = instanceOf(id)
     instance.pending = 'starting'
@@ -427,7 +440,7 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     instance.lastOperation = 'start'
     touch()
     try {
-      const existingPid = definition.port === null ? null : await listenerIdentity(definition)
+      const existingPid = definition.port === null ? null : await listenerIdentity(definition, check)
       if (!allowed()) return 'skipped'
       // 配置在探测期间被编辑时重新判断，旧监听者也不能代表新定义已就绪。
       if (restoring) {
@@ -436,7 +449,7 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
       }
       if (existingPid !== null) return 'already-running'
       if (instance.handle == null || instance.handleAlive === false) {
-        assertActive() // 最后一道同步门禁：此处到 spawn 之间没有 await。
+        check() // 最后一道同步门禁：此处到 spawn 之间没有 await。
         const handle = ctx.subprocess.spawn({
           argv: launchArgv(definition.command), cwd: definition.cwd, env: { ...definition.env },
           stdio: {
@@ -470,12 +483,12 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
         })
       }
       if (definition.port === null) return 'dispatched' // 没有网络就绪证据，不声称已运行。
-      const listening = await waitForPortListening(definition.port, { timeoutMs: START_WAIT_MS })
-      assertActive()
+      const listening = await waitForPortListening(definition.port, { timeoutMs: START_WAIT_MS, check })
+      check()
       if (!instance.handleAlive) throw fail('OPERATION_FAILED', instance.lastError ?? '启动的进程已退出，未确认服务就绪。')
       if (!listening) throw fail('TIMEOUT', '启动后 ' + START_WAIT_MS + 'ms 内端口 ' + definition.port + ' 未进入监听')
       const pid = await listenerIdentity(definition)
-      assertActive()
+      check()
       if (!instance.handleAlive) throw fail('OPERATION_FAILED', '启动的进程在就绪确认期间退出。')
       if (pid === null) throw fail('TIMEOUT', '就绪确认期间端口已停止监听。')
       return 'started'
@@ -491,8 +504,8 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     }
   }
 
-  async function stopInternal(definition) {
-    assertActive()
+  async function stopInternal(definition, { check = assertActive } = {}) {
+    check()
     const instance = instanceOf(definition.id)
     instance.pending = 'stopping'
     instance.lastOperation = 'stop'
@@ -509,17 +522,17 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
         } catch (error) {
           handleExitError = error
         }
-        assertActive()
+        check()
       }
       if (definition.port !== null) {
-        const pid = await listenerIdentity(definition)
-        assertActive()
+        const pid = await listenerIdentity(definition, check)
+        check()
         if (pid !== null) {
           // options.force 与 takeover=force 均不能绕过以上实时签名校验。
           await killTree(pid)
-          assertActive()
-          const free = await waitForPortFree(definition.port, { timeoutMs: STOP_WAIT_MS })
-          assertActive()
+          check()
+          const free = await waitForPortFree(definition.port, { timeoutMs: STOP_WAIT_MS, check })
+          check()
           if (!free) throw fail('TIMEOUT', '已发出终止命令，但端口仍未释放。', { port: definition.port, pid })
         }
       }
@@ -759,20 +772,53 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
    * 仍然走 saveConfig（校验 + 原子写 + expectedRevision），所以并发保护与「配置即唯一真相」都不变。
    * @param {{service?: object, expectedRevision?: string}} payload
    */
-  async function configUpsert(payload = {}) {
+  function checkRevision(current, expectedRevision) {
+    if (expectedRevision !== current.revision) throw fail('CONFIG_CONFLICT', 'Configuration changed', { expectedRevision, actualRevision: current.revision })
+  }
+
+  function agentCandidate(merged) {
+    for (const [field, expected] of [['takeover', 'match'], ['restartMode', 'inline']]) {
+      if (merged[field] && merged[field] !== expected) throw fail('CONFIG_INVALID', 'Unsupported agent service policy', { reason: 'UNSUPPORTED_POLICY', field })
+    }
+    if (!path.isAbsolute(merged.cwd) || merged.cwd.includes('\0')) throw fail('CONFIG_INVALID', 'Absolute service cwd required', { reason: 'ABSOLUTE_CWD_REQUIRED', field: 'cwd' })
+    try {
+      if (!fs.statSync(merged.cwd).isDirectory()) throw new Error('not directory')
+      return { ...merged, cwd: fs.realpathSync(merged.cwd) }
+    } catch { throw fail('CONFIG_INVALID', 'Service cwd must be an existing directory', { reason: 'CWD_NOT_FOUND', field: 'cwd' }) }
+  }
+
+  // Preview uses the same candidate validation/CAS as commit; approval gets the actual target.
+  function agentIntent(service, expectedRevision) {
+    const { services: _services, ...current } = readConfig(configPath, { create: false })
+    assertActive()
+    if (current.issues.length) throw fail('CONFIG_INVALID', 'Service configuration needs repair', { reason: 'CONFIG_REPAIR_REQUIRED' })
+    checkRevision(current, expectedRevision)
+    const before = JSON.parse(current.raw).services.find((entry) => entry.id.trim() === service.id)
+    const candidate = agentCandidate(mergeRegistration(before ?? null, service))
+    return { cwd: candidate.cwd, autostart: candidate.autostart === true }
+  }
+
+  async function configUpsert(payload = {}, { agent = false, approvedCwd } = {}) {
+    assertActive()
     const input = payload.service
     if (input === null || typeof input !== 'object' || Array.isArray(input)) throw fail('CONFIG_INVALID', 'config.upsert 需要 service 对象')
-    const current = readConfig(configPath)
+    const current = readConfig(configPath, { create: !agent })
     if (current.issues.length) throw fail('CONFIG_INVALID', '配置含无效条目，请先修复再登记服务。', { issues: current.issues })
     if (typeof payload.expectedRevision !== 'string' || !payload.expectedRevision) throw fail('CONFIG_INVALID', 'config.upsert 需要 expectedRevision；请先 config.get。')
+    checkRevision(current, payload.expectedRevision)
     const document = JSON.parse(current.raw)
     if (payload.registration === true) {
       const index = document.services.findIndex((entry) => entry.id.trim() === input.id)
-      const merged = mergeRegistration(index < 0 ? null : document.services[index], input)
+      let merged = mergeRegistration(index < 0 ? null : document.services[index], input)
+      if (agent) {
+        merged = agentCandidate(merged)
+        if (approvedCwd !== undefined && merged.cwd !== approvedCwd) throw fail('CONFIG_INVALID', 'Approval target changed', { reason: 'APPROVAL_TARGET_CHANGED', field: 'cwd' })
+      }
       if (index < 0) document.services.push(merged)
       else document.services[index] = merged
       const saved = saveConfig(configPath, JSON.stringify(document), payload.expectedRevision, { preserveFields: true })
       touch()
+      if (agent) return { id: input.id, changed: saved.raw !== current.raw, configRevision: saved.revision, registered: true, started: false, autostart: merged.autostart === true }
       return { path: saved.path, revision: saved.revision, configRevision: saved.revision, raw: saved.raw, id: input.id }
     }
     const existing = new Map(current.services.map((definition) => [definition.id, definition]))
@@ -858,5 +904,131 @@ export function createManager({ ctx, configPath, stateDir, logDir, supervisorScr
     return id
   }
 
-  return { handle, snapshot, start, stop, restart, autostart, dispose, scheduleDshRestart, configPath, logDir }
+  // Native operations use the same queue, policy writer and process owner as the UI.
+  function agentOperationIntent(args) {
+    assertActive()
+    const current = readConfig(configPath, { create: false })
+    if (current.issues.length) throw fail('CONFIG_INVALID', 'Service configuration needs repair')
+    checkRevision(current, args.expectedRevision)
+    const id = args.service?.id ?? args.id
+    const before = JSON.parse(current.raw).services.find((entry) => entry.id.trim() === id)
+    if (args.action !== 'attach' && !before) throw fail('SERVICE_NOT_FOUND', 'Service not found')
+    if (args.action === 'attach' && args.service.autostart === false) throw fail('CONFIG_INVALID', 'Attach enables autostart; use register for registration only')
+    const candidate = agentCandidate(mergeRegistration(before ?? null, args.action === 'attach' ? { ...args.service, autostart: true } : { id }))
+    if (!Number.isInteger(candidate.port) || !candidate.match?.commandLinePattern) throw fail('CONFIG_INVALID', 'Native lifecycle requires a fixed port and signature')
+    return { id, cwd: candidate.cwd, port: candidate.port, autostart: args.action === 'stop' ? false : args.action === 'restart' ? candidate.autostart === true : true }
+  }
+
+  async function agentStatus(id, { check = assertActive } = {}) {
+    check()
+    const { services, configRevision } = agentDefinitions()
+    const definition = services.find((entry) => entry.id === id)
+    if (!definition) throw fail('SERVICE_NOT_FOUND', 'Service not found')
+    const instance = instances.get(id)
+    const result = { id, port: definition.port, url: definition.url, autostart: definition.autostart,
+      status: 'unknown', ownership: 'none', pid: null, identityVerified: false, healthy: null,
+      observedAt: now(), configRevision, runtimeObserved: true }
+    const ensure = () => {
+      check()
+      checkRevision({ revision: agentDefinitions().configRevision }, configRevision)
+    }
+    if (definition.port === null) return result
+    try {
+      const pid = await listenerIdentity(definition, ensure)
+      ensure()
+      result.pid = pid
+      if (pid === null) {
+        result.status = instance?.handleAlive ? 'starting' : 'stopped'
+        return result
+      }
+      result.identityVerified = true
+      result.status = 'running'
+      result.ownership = instance?.handleAlive ? 'spawned' : 'discovered'
+      if (definition.probe?.path != null) {
+        result.healthy = (await httpProbe(definition.host, definition.port, definition.probe.path, definition.probe.expectStatus)).healthy
+        ensure()
+        // A health response is not evidence that the same listener still owns the port.
+        if (await listenerIdentity(definition, ensure) !== pid) throw fail('PORT_OWNED_BY_OTHER', 'Listener changed during probe')
+      }
+    } catch (error) {
+      ensure()
+      if (!['PORT_OWNED_BY_OTHER', 'OPERATION_FAILED'].includes(error?.code) && error?.code) throw error
+      result.status = error?.code === 'PORT_OWNED_BY_OTHER' || error?.code === 'OPERATION_FAILED' ? 'conflict' : 'unknown'
+      result.pid = Number.isInteger(error?.details?.pid) ? error.details.pid : null
+      result.identityVerified = false
+      result.healthy = null
+      result.ownership = 'none'
+    }
+    return result
+  }
+
+  function agentOperate(args, { authorize, approvedCwd } = {}) {
+    const id = args.service?.id ?? args.id
+    return enqueue(id, async () => {
+      let configRevision = args.expectedRevision
+      let phase = 'preparing', policyCommitted = false, registered = false, runtimeMayHaveChanged = false
+      let autostart, registrationChanged
+      const check = () => {
+        assertActive()
+        authorize?.()
+        const current = agentDefinitions()
+        checkRevision({ revision: current.configRevision }, configRevision)
+        if (approvedCwd !== undefined && phase !== 'preparing') {
+          const target = current.services.find((entry) => entry.id === id)
+          if (target && agentCandidate(target).cwd !== approvedCwd) throw fail('CONFIG_INVALID', 'Approval target changed', { reason: 'APPROVAL_TARGET_CHANGED', field: 'cwd' })
+        }
+      }
+      try {
+        check()
+        const intent = agentOperationIntent(args) // CAS is rechecked after admission to the service queue.
+        if (approvedCwd !== undefined && intent.cwd !== approvedCwd) throw fail('CONFIG_INVALID', 'Approval target changed', { reason: 'APPROVAL_TARGET_CHANGED', field: 'cwd' })
+        if (args.action === 'attach') {
+          const saved = await agentRegister({ ...args.service, autostart: true }, configRevision, approvedCwd)
+          configRevision = saved.configRevision
+          registrationChanged = saved.changed
+          registered = true; policyCommitted = true; autostart = true
+        } else if (args.action !== 'restart') {
+          const saved = setAutostart(configPath, id, args.action === 'start')
+          configRevision = saved.revision
+          policyCommitted = true; autostart = args.action === 'start'
+          touch()
+        }
+        check()
+        const definition = managedDefinition(id)
+        phase = args.action === 'stop' || args.action === 'restart' ? 'stopping' : 'starting'
+        runtimeMayHaveChanged = true
+        let status
+        if (args.action === 'restart') {
+          await stopInternal(definition, { check })
+          check()
+          phase = 'starting'
+          status = await startInternal(definition, { check })
+        } else if (args.action === 'stop') status = await stopInternal(definition, { check })
+        else status = await startInternal(definition, { check })
+        phase = 'verifying'
+        const runtime = await agentStatus(id, { check })
+        check()
+        if (args.action !== 'stop' && (runtime.status !== 'running' || !runtime.identityVerified)) throw fail('OPERATION_FAILED', 'Service identity not verified')
+        if (args.action !== 'stop' && definition.probe?.path != null && runtime.healthy !== true) throw fail('HEALTH_CHECK_FAILED', 'Configured health probe did not succeed')
+        if (args.action === 'stop' && runtime.status !== 'stopped') throw fail('OPERATION_FAILED', 'Service not confirmed stopped')
+        return { id, ...(args.action === 'attach' ? { registered: true, registrationChanged } : {}),
+          policyCommitted, configRevision, autostart: definition.autostart, status, runtime }
+      } catch (error) {
+        throw fail(error?.code ?? 'OPERATION_FAILED', String(error?.message ?? error), {
+          ...error?.details, id, phase, registered, registrationChanged, policyCommitted, autostart,
+          configRevision, runtimeMayHaveChanged,
+        })
+      }
+    })
+  }
+
+  // Agent adapters share this owner; safe reads neither seed a file nor expose Host argv.
+  function agentDefinitions() {
+    assertActive()
+    const config = readConfig(configPath, { create: false })
+    if (config.issues.length) throw fail('CONFIG_INVALID', 'Service configuration needs repair')
+    return { services: config.services, configRevision: config.revision }
+  }
+  const agentRegister = (service, expectedRevision, approvedCwd) => configUpsert({ service, expectedRevision, registration: true }, { agent: true, approvedCwd })
+  return { handle, snapshot, start, stop, restart, autostart, dispose, scheduleDshRestart, configPath, logDir, agentDefinitions, agentRegister, agentIntent, agentOperationIntent, agentStatus, agentOperate }
 }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-services-manager",
-  "version": "0.2.2",
+  "version": "0.2.6",
   "private": true,
   "type": "module",
   "description": "DSH 0.2 Desktop/Web 的服务管理分区：查看与控制宿主后台服务，并按运行时安全重启当前 DSH。",
@@ -14,6 +14,9 @@
   "exports": {
     ".": "./src/index.mjs",
     "./client": "./lib/client.js",
+    "./skills": "./src/skill-plugin.mjs",
+    "./skills/locale/*.json": "./locale/skills/*.json",
+    "./skills/icon": "./icon.svg",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
@@ -23,6 +26,8 @@
     "src/",
     "lib/",
     "docs/",
+    "skills/",
+    "locale/skills/",
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
@@ -39,7 +44,8 @@
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-ui-settings"
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
       ],
       "platform": "web"
     }

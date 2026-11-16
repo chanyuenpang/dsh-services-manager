@@ -33,6 +33,12 @@ test('launchArgv 在 POSIX 上交给 sh 解析整条命令', () => {
   assert.deepEqual(launchArgv('node a.mjs && echo done', 'linux'), ['/bin/sh', '-lc', 'node a.mjs && echo done'])
 })
 
+test('absolute Windows exe paths bypass cmd reparsing, including spaces', () => {
+  assert.deepEqual(launchArgv('"H:/Program Files/Deepseek/DeepSeek Harness.exe" "G:/artifact folder/static-server.mjs" --port 49384','win32'),
+    ['H:/Program Files/Deepseek/DeepSeek Harness.exe','G:/artifact folder/static-server.mjs','--port','49384'])
+  assert.equal(launchArgv('npm run dev -- --port 49384','win32')[0],'cmd.exe')
+})
+
 function capture(fn) {
   try {
     fn()

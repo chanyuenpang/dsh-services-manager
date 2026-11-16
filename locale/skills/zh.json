@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "网站挂载技能",
+    "description": "为 Agent 注册包内 services-manager 技能及离线发现资源。无需单独安装技能，不写入全局技能目录；禁用此条目即撤销注册。"
+  }
+}

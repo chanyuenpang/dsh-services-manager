@@ -7,6 +7,8 @@
  * 正确形态与 DSH 自己的 runner 一致：`cmd.exe /d /s /c <程序> <参数…>`，参数各自独立。
  */
 
+import path from 'node:path'
+
 /** Windows 上无法在「分词后直传」的形式里表达的 shell 连接符。 */
 const SHELL_OPERATOR = /[|&;<>^]|\|\||&&/
 
@@ -69,5 +71,9 @@ export function launchArgv(command, platform = process.platform) {
     error.code = 'CONFIG_INVALID'
     throw error
   }
-  return ['cmd.exe', '/d', '/s', '/c', ...splitCommand(command)]
+  const argv = splitCommand(command)
+  // Concrete executables do not need cmd. Its extra parsing corrupts quoted paths
+  // such as Program Files when the actual Host subprocess runner dispatches them.
+  if (path.win32.isAbsolute(argv[0]) && /[.]exe$/i.test(argv[0])) return argv
+  return ['cmd.exe', '/d', '/s', '/c', ...argv]
 }

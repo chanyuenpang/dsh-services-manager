@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Service attachment skill",
+    "description": "Registers the bundled services-manager skill and its offline discovery resources for agents. No global skill files are written; disabling this entry withdraws its registration."
+  }
+}
