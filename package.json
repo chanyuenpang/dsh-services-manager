@@ -1,7 +1,10 @@
 {
   "name": "dsh-services-manager",
   "version": "0.2.6",
-  "private": true,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "type": "module",
   "description": "DSH 0.2 Desktop/Web 的服务管理分区：查看与控制宿主后台服务，并按运行时安全重启当前 DSH。",
   "keywords": ["dsh", "deepseek-harness", "cordis-plugin", "services"],
